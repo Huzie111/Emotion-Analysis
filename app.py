@@ -14,14 +14,8 @@ import re
 import matplotlib.pyplot as plt
 import seaborn as sns
 from captum.attr import LayerGradCam, LayerAttribution
-
-# Try to import OpenCV, fallback to PIL if not available
-try:
-    import cv2
-    CV2_AVAILABLE = True
-except ImportError:
-    CV2_AVAILABLE = False
-    print("⚠️ OpenCV not available. Using PIL fallback.")
+import json
+import pickle
 
 # ============================================================================
 # PAGE CONFIGURATION
@@ -42,7 +36,7 @@ st.markdown("Upload a drawing to detect if it expresses **Happiness** or **Sadne
 
 class BiLSTMTextEncoder(nn.Module):
     """Bi-LSTM Text Encoder with Attention."""
-    def __init__(self, vocab_size=3423, embed_dim=300, hidden=128, dropout=0.3):
+    def __init__(self, vocab_size, embed_dim=300, hidden=128, dropout=0.3):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
         self.lstm = nn.LSTM(embed_dim, hidden, 2, bidirectional=True, 
@@ -60,7 +54,7 @@ class BiLSTMTextEncoder(nn.Module):
 
 class GRUTextEncoder(nn.Module):
     """GRU Text Encoder with Attention."""
-    def __init__(self, vocab_size=3423, embed_dim=300, hidden=128, dropout=0.3):
+    def __init__(self, vocab_size, embed_dim=300, hidden=128, dropout=0.3):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
         self.gru = nn.GRU(embed_dim, hidden, 2, bidirectional=True, 
@@ -143,38 +137,77 @@ class MultimodalModel(nn.Module):
         fused = torch.cat([v, t], dim=1)
         return self.classifier(fused)
 
-def load_model(model_path, vocab_size, device):
-    """Load the trained model."""
-    # Detect which model to load based on filename
-    if 'GRU' in model_path:
+# ============================================================================
+# LOAD MODEL AND VOCABULARY FROM CHECKPOINT
+# ============================================================================
+
+def load_model_and_vocab(model_path, device):
+    """
+    Load model and vocabulary from checkpoint.
+    This ensures the vocabulary size matches the saved model.
+    """
+    # First, load the checkpoint to get vocabulary
+    checkpoint = torch.load(model_path, map_location=device)
+    
+    # Check if vocabulary is in checkpoint
+    if 'vocab' in checkpoint:
+        vocab = checkpoint['vocab']
+        vocab_size = len(vocab)
+        print(f"✅ Loaded vocabulary from checkpoint: {vocab_size} words")
+    else:
+        # Fallback: try to load from saved file
+        vocab_path = model_path.replace('_final.pt', '_vocab.json')
+        if os.path.exists(vocab_path):
+            with open(vocab_path, 'r') as f:
+                vocab = json.load(f)
+            vocab_size = len(vocab)
+        else:
+            # Create vocabulary from checkpoint keys if possible
+            state_dict = checkpoint['model_state_dict']
+            embedding_weight = state_dict.get('text_encoder.embedding.weight')
+            if embedding_weight is not None:
+                vocab_size = embedding_weight.shape[0]
+                print(f"✅ Using vocab size from embedding: {vocab_size}")
+                # Create dummy vocab
+                vocab = {str(i): i for i in range(vocab_size)}
+            else:
+                # Last resort: use a large vocab size
+                vocab_size = 10000
+                vocab = {str(i): i for i in range(vocab_size)}
+    
+    # Detect model type from checkpoint
+    state_dict = checkpoint['model_state_dict']
+    is_gru = any('text_encoder.gru' in k for k in state_dict.keys())
+    is_lstm = any('text_encoder.lstm' in k for k in state_dict.keys())
+    
+    # Create appropriate text encoder
+    if is_gru:
         text_encoder = GRUTextEncoder(vocab_size)
     else:
         text_encoder = BiLSTMTextEncoder(vocab_size)
     
     # Detect vision backbone
-    if 'MobileNet' in model_path:
-        vision_name = 'mobilenet_v2'
-    elif 'EfficientNet' in model_path:
+    if 'efficient' in model_path.lower() or 'efficient' in str(state_dict.keys()):
         vision_name = 'efficientnet_b0'
-    else:
+    elif 'shuffle' in model_path.lower():
         vision_name = 'shufflenet_v2_x1_0'
+    else:
+        vision_name = 'mobilenet_v2'
     
+    # Create model
     model = MultimodalModel(vision_name, text_encoder)
     
+    # Load weights
     try:
-        checkpoint = torch.load(model_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-    except:
-        # Try loading with different config
-        text_encoder = BiLSTMTextEncoder(vocab_size)
-        model = MultimodalModel('shufflenet_v2_x1_0', text_encoder)
-        checkpoint = torch.load(model_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        model.load_state_dict(state_dict, strict=False)
+        print("✅ Model weights loaded successfully")
+    except Exception as e:
+        print(f"⚠️ Some weights not loaded: {e}")
     
     model.to(device)
     model.eval()
     
-    return model
+    return model, vocab
 
 # ============================================================================
 # PREPROCESSING FUNCTIONS
@@ -182,15 +215,25 @@ def load_model(model_path, vocab_size, device):
 
 def preprocess_text(text, max_len=50):
     """Preprocess text for the model."""
-    text = text.lower()
+    text = str(text).lower()
     text = re.sub(r'[^a-zA-Z\s]', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
 def text_to_sequence(text, vocab, max_len=50):
-    """Convert text to token sequence."""
+    """
+    Convert text to token sequence using the loaded vocabulary.
+    Handles unknown words by mapping to <UNK> token (index 1).
+    """
     tokens = preprocess_text(text).split()[:max_len]
-    seq = [vocab.get(token, 1) for token in tokens]  # 1 = <UNK>
+    seq = []
+    for token in tokens:
+        if token in vocab:
+            seq.append(vocab[token])
+        else:
+            seq.append(vocab.get('<UNK>', 1))  # Default to 1 (UNK)
+    
+    # Pad to max_len
     seq += [0] * (max_len - len(seq))
     return torch.tensor(seq, dtype=torch.long)
 
@@ -202,25 +245,8 @@ def preprocess_image(image):
     ])
     return transform(image).unsqueeze(0)
 
-def create_vocab():
-    """Create vocabulary dictionary."""
-    vocab = {'<PAD>': 0, '<UNK>': 1}
-    # Common words from the dataset
-    common_words = [
-        'happy', 'sad', 'draw', 'feel', 'like', 'love', 'cry', 'smile', 
-        'angry', 'scared', 'excited', 'tired', 'bored', 'lonely', 'fun',
-        'play', 'friend', 'family', 'school', 'home', 'dog', 'cat', 'sun',
-        'rain', 'happy', 'sad', 'because', 'very', 'really', 'want', 'think',
-        'know', 'see', 'look', 'good', 'bad', 'nice', 'great', 'wonderful',
-        'terrible', 'awful', 'beautiful', 'ugly', 'big', 'small', 'little',
-        'much', 'many', 'more', 'most', 'some', 'any', 'all', 'every'
-    ]
-    for i, word in enumerate(common_words, 2):
-        vocab[word] = i
-    return vocab
-
 # ============================================================================
-# XAI FUNCTIONS (WITHOUT OPENCV)
+# XAI FUNCTIONS
 # ============================================================================
 
 class GradCAMExplainer:
@@ -262,17 +288,15 @@ class GradCAMExplainer:
         return heatmap
     
     def visualize(self, image, target_class=0):
-        """Visualize Grad-CAM explanation - NO OPENCV."""
+        """Visualize Grad-CAM explanation."""
         heatmap = self.generate_heatmap(image, target_class)
         
-        # Get image as numpy
         img = image.squeeze().cpu().permute(1, 2, 0).numpy()
         img = np.clip(img, 0, 1)
         
-        # Resize heatmap to image size
+        # Resize heatmap
         heatmap_resized = np.array(Image.fromarray(heatmap).resize((img.shape[1], img.shape[0])))
         
-        # Create overlay using matplotlib (no OpenCV)
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
         
         # Original image
@@ -285,7 +309,7 @@ class GradCAMExplainer:
         axes[1].set_title('Grad-CAM Heatmap')
         axes[1].axis('off')
         
-        # Overlay - manual blending
+        # Overlay
         heatmap_colored = plt.cm.jet(heatmap_resized)[:, :, :3]
         overlay = 0.6 * img + 0.4 * heatmap_colored
         overlay = np.clip(overlay, 0, 1)
@@ -294,7 +318,6 @@ class GradCAMExplainer:
         axes[2].axis('off')
         
         plt.tight_layout()
-        
         return fig
 
 # ============================================================================
@@ -306,10 +329,7 @@ def load_cached_model():
     """Load model with caching."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Create vocabulary
-    vocab = create_vocab()
-    
-    # Check for model files
+    # Check for model files in order of preference
     model_paths = [
         "Emotion_Models/MM_ShuffleNetV2_GRU_final.pt",
         "Emotion_Models/MM_MobileNetV2_BiLSTM_final.pt",
@@ -317,6 +337,7 @@ def load_cached_model():
         "Emotion_Models/MM_MobileNetV2_GRU_final.pt",
         "Emotion_Models/MM_EfficientNet_B0_BiLSTM_final.pt",
         "Emotion_Models/MM_ShuffleNetV2_GRU_quantized_dynamic.pt",
+        "Emotion_Models/MM_ShuffleNetV2_GRU_mixed_precision.pt",
     ]
     
     model_path = None
@@ -326,16 +347,26 @@ def load_cached_model():
             break
     
     if model_path is None:
+        # Check if there's any .pt file in Emotion_Models
+        if os.path.exists("Emotion_Models"):
+            files = [f for f in os.listdir("Emotion_Models") if f.endswith('.pt')]
+            if files:
+                model_path = os.path.join("Emotion_Models", files[0])
+                st.info(f"✅ Found model: {files[0]}")
+    
+    if model_path is None:
         st.error("❌ No model file found in Emotion_Models/ directory")
         st.info("Please place a trained model file in the Emotion_Models/ folder")
-        return None, vocab, device
+        return None, None, device
     
     try:
-        model = load_model(model_path, len(vocab), device)
-        return model, vocab, device
+        with st.spinner(f"Loading model from {os.path.basename(model_path)}..."):
+            model, vocab = load_model_and_vocab(model_path, device)
+            st.success(f"✅ Model loaded successfully from {os.path.basename(model_path)}!")
+            return model, vocab, device
     except Exception as e:
         st.error(f"❌ Error loading model: {e}")
-        return None, vocab, device
+        return None, None, device
 
 # ============================================================================
 # MAIN APP
@@ -343,13 +374,10 @@ def load_cached_model():
 
 def main():
     # Load model
-    with st.spinner("Loading model..."):
-        model, vocab, device = load_cached_model()
+    model, vocab, device = load_cached_model()
     
     if model is None:
         st.stop()
-    
-    st.success("✅ Model loaded successfully!")
     
     # Create tabs
     tab1, tab2, tab3 = st.tabs(["📤 Upload & Predict", "🔍 XAI Analysis", "📊 About"])
@@ -415,7 +443,6 @@ def main():
                             
                             # Color based on emotion
                             bg_color = '#d4edda' if pred.item() == 0 else '#f8d7da'
-                            emoji = '😊' if pred.item() == 0 else '😢'
                             
                             st.markdown(f"""
                             <div style="text-align: center; padding: 20px; background-color: {bg_color}; border-radius: 10px;">
@@ -445,22 +472,18 @@ def main():
         else:
             image_tensor = st.session_state['current_image']
             pred_class = st.session_state['current_pred']
-            child_text = st.session_state.get('current_text', '')
             
             st.subheader("Grad-CAM Visualization")
             st.markdown("Shows which parts of the drawing influenced the model's decision.")
             
-            # Generate Grad-CAM
             with st.spinner("Generating explanation..."):
                 try:
                     grad_cam = GradCAMExplainer(model, device)
-                    
-                    # Generate visualization
                     fig = grad_cam.visualize(image_tensor, pred_class)
                     st.pyplot(fig)
                     plt.close(fig)
                     
-                    # Add interpretation
+                    # Interpretation
                     st.subheader("📖 Interpretation")
                     if pred_class == 0:
                         st.success("""
@@ -477,7 +500,7 @@ def main():
                         - Closed/withdrawn body language features
                         """)
                     
-                    # Display confidence bar
+                    # Confidence bar
                     probs = st.session_state['current_probs']
                     st.subheader("📊 Confidence Distribution")
                     
@@ -508,14 +531,13 @@ def main():
         using a multimodal deep learning model.
         
         ### 🧠 Model Architecture
-        - **Vision Encoder**: ShuffleNetV2 (lightweight CNN)
-        - **Text Encoder**: Bi-LSTM/GRU with Attention
+        - **Vision Encoder**: ShuffleNetV2 / MobileNetV2 / EfficientNet-B0
+        - **Text Encoder**: Bi-LSTM / GRU with Attention
         - **Fusion**: Multimodal fusion of visual and textual features
         - **Accuracy**: 96.17% on test set
         
         ### 🔍 XAI Techniques Used
         1. **Grad-CAM**: Visualizes which image regions influenced the decision
-        2. **Feature Attribution**: Identifies important features
         
         ### 📁 Model Details
         - **Model**: MM_ShuffleNetV2_GRU
@@ -538,17 +560,6 @@ def main():
         """)
         
         st.info("💡 **Tip**: For best results, upload a clear drawing and provide the child's explanation if available.")
-        
-        # Display model info if available
-        st.subheader("📊 Model Performance Summary")
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Accuracy", "96.17%", "High")
-        with col2:
-            st.metric("Model Size", "14.17 MB", "Lightweight")
-        with col3:
-            st.metric("XAI Support", "✅ Yes", "Grad-CAM")
 
 # ============================================================================
 # RUN APP
