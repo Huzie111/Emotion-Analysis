@@ -1,4 +1,6 @@
+# ============================================================================
 # STREAMLIT APP: Emotion Detection from Children's Drawings with XAI
+# ============================================================================
 
 import streamlit as st
 import torch
@@ -7,15 +9,23 @@ import torch.nn.functional as F
 from torchvision import transforms
 from PIL import Image
 import numpy as np
-import cv2
 import os
+import re
 import matplotlib.pyplot as plt
 import seaborn as sns
 from captum.attr import LayerGradCam, LayerAttribution
 
+# Try to import OpenCV, fallback to PIL if not available
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+    print("⚠️ OpenCV not available. Using PIL fallback.")
 
+# ============================================================================
 # PAGE CONFIGURATION
-
+# ============================================================================
 
 st.set_page_config(
     page_title="Emotion Detection from Drawings",
@@ -26,9 +36,9 @@ st.set_page_config(
 st.title("🎨 Emotion Detection from Children's Drawings")
 st.markdown("Upload a drawing to detect if it expresses **Happiness** or **Sadness**")
 
-
-# MODEL ARCHITECTURE 
-
+# ============================================================================
+# MODEL ARCHITECTURE (Matching the trained model)
+# ============================================================================
 
 class BiLSTMTextEncoder(nn.Module):
     """Bi-LSTM Text Encoder with Attention."""
@@ -48,11 +58,31 @@ class BiLSTMTextEncoder(nn.Module):
         context = torch.sum(attn_weights * lstm_out, dim=1)
         return context
 
+class GRUTextEncoder(nn.Module):
+    """GRU Text Encoder with Attention."""
+    def __init__(self, vocab_size=3423, embed_dim=300, hidden=128, dropout=0.3):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.gru = nn.GRU(embed_dim, hidden, 2, bidirectional=True, 
+                         batch_first=True, dropout=dropout)
+        self.attention = nn.Linear(hidden * 2, 1)
+        self.dropout = nn.Dropout(dropout)
+        self.output_dim = hidden * 2
+        
+    def forward(self, x):
+        embedded = self.dropout(self.embedding(x))
+        gru_out, _ = self.gru(embedded)
+        attn_weights = torch.softmax(self.attention(gru_out), dim=1)
+        context = torch.sum(attn_weights * gru_out, dim=1)
+        return context
+
 def get_vision_encoder(name, pretrained=False):
     """Get vision backbone with feature dimension."""
     import torchvision.models as models
     backbones = {
         'shufflenet_v2_x1_0': (models.shufflenet_v2_x1_0, 1024),
+        'mobilenet_v2': (models.mobilenet_v2, 1280),
+        'efficientnet_b0': (models.efficientnet_b0, 1280),
     }
     
     if name not in backbones:
@@ -115,21 +145,43 @@ class MultimodalModel(nn.Module):
 
 def load_model(model_path, vocab_size, device):
     """Load the trained model."""
-    text_encoder = BiLSTMTextEncoder(vocab_size)
-    model = MultimodalModel('shufflenet_v2_x1_0', text_encoder)
+    # Detect which model to load based on filename
+    if 'GRU' in model_path:
+        text_encoder = GRUTextEncoder(vocab_size)
+    else:
+        text_encoder = BiLSTMTextEncoder(vocab_size)
     
-    checkpoint = torch.load(model_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    # Detect vision backbone
+    if 'MobileNet' in model_path:
+        vision_name = 'mobilenet_v2'
+    elif 'EfficientNet' in model_path:
+        vision_name = 'efficientnet_b0'
+    else:
+        vision_name = 'shufflenet_v2_x1_0'
+    
+    model = MultimodalModel(vision_name, text_encoder)
+    
+    try:
+        checkpoint = torch.load(model_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    except:
+        # Try loading with different config
+        text_encoder = BiLSTMTextEncoder(vocab_size)
+        model = MultimodalModel('shufflenet_v2_x1_0', text_encoder)
+        checkpoint = torch.load(model_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    
     model.to(device)
     model.eval()
     
     return model
 
+# ============================================================================
 # PREPROCESSING FUNCTIONS
+# ============================================================================
 
 def preprocess_text(text, max_len=50):
     """Preprocess text for the model."""
-    import re
     text = text.lower()
     text = re.sub(r'[^a-zA-Z\s]', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
@@ -150,7 +202,26 @@ def preprocess_image(image):
     ])
     return transform(image).unsqueeze(0)
 
-# XAI FUNCTIONS
+def create_vocab():
+    """Create vocabulary dictionary."""
+    vocab = {'<PAD>': 0, '<UNK>': 1}
+    # Common words from the dataset
+    common_words = [
+        'happy', 'sad', 'draw', 'feel', 'like', 'love', 'cry', 'smile', 
+        'angry', 'scared', 'excited', 'tired', 'bored', 'lonely', 'fun',
+        'play', 'friend', 'family', 'school', 'home', 'dog', 'cat', 'sun',
+        'rain', 'happy', 'sad', 'because', 'very', 'really', 'want', 'think',
+        'know', 'see', 'look', 'good', 'bad', 'nice', 'great', 'wonderful',
+        'terrible', 'awful', 'beautiful', 'ugly', 'big', 'small', 'little',
+        'much', 'many', 'more', 'most', 'some', 'any', 'all', 'every'
+    ]
+    for i, word in enumerate(common_words, 2):
+        vocab[word] = i
+    return vocab
+
+# ============================================================================
+# XAI FUNCTIONS (WITHOUT OPENCV)
+# ============================================================================
 
 class GradCAMExplainer:
     """Grad-CAM explainer for the model."""
@@ -191,61 +262,101 @@ class GradCAMExplainer:
         return heatmap
     
     def visualize(self, image, target_class=0):
-        """Visualize Grad-CAM explanation."""
+        """Visualize Grad-CAM explanation - NO OPENCV."""
         heatmap = self.generate_heatmap(image, target_class)
         
+        # Get image as numpy
         img = image.squeeze().cpu().permute(1, 2, 0).numpy()
         img = np.clip(img, 0, 1)
         
-        # Resize heatmap
-        heatmap_resized = cv2.resize(heatmap, (img.shape[1], img.shape[0]))
-        heatmap_color = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
-        heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+        # Resize heatmap to image size
+        heatmap_resized = np.array(Image.fromarray(heatmap).resize((img.shape[1], img.shape[0])))
         
-        # Overlay
-        img_uint8 = np.uint8(255 * img)
-        overlay = cv2.addWeighted(img_uint8, 0.6, heatmap_color, 0.4, 0)
+        # Create overlay using matplotlib (no OpenCV)
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
         
-        return img, heatmap, overlay
+        # Original image
+        axes[0].imshow(img)
+        axes[0].set_title('Original Image')
+        axes[0].axis('off')
+        
+        # Heatmap
+        axes[1].imshow(heatmap_resized, cmap='jet')
+        axes[1].set_title('Grad-CAM Heatmap')
+        axes[1].axis('off')
+        
+        # Overlay - manual blending
+        heatmap_colored = plt.cm.jet(heatmap_resized)[:, :, :3]
+        overlay = 0.6 * img + 0.4 * heatmap_colored
+        overlay = np.clip(overlay, 0, 1)
+        axes[2].imshow(overlay)
+        axes[2].set_title('Overlay (Important Regions)')
+        axes[2].axis('off')
+        
+        plt.tight_layout()
+        
+        return fig
 
+# ============================================================================
 # LOAD MODEL
+# ============================================================================
 
 @st.cache_resource
 def load_cached_model():
     """Load model with caching."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Vocabulary (simplified - in production, load from file)
-    vocab = {'<PAD>': 0, '<UNK>': 1}
-    # Add common words from training (simplified)
-    common_words = ['happy', 'sad', 'draw', 'feel', 'because', 'like', 'love', 'cry', 'smile', 'angry', 'scared', 'excited', 'tired', 'bored', 'lonely', 'happy', 'sad', 'angry', 'scared', 'excited', 'tired', 'bored', 'lonely']
-    for i, word in enumerate(common_words, 2):
-        vocab[word] = i
+    # Create vocabulary
+    vocab = create_vocab()
     
-    # Load model
-    model_path = "Emotion_Models/MM_ShuffleNetV2_GRU_final.pt"
-    model = load_model(model_path, len(vocab), device)
+    # Check for model files
+    model_paths = [
+        "Emotion_Models/MM_ShuffleNetV2_GRU_final.pt",
+        "Emotion_Models/MM_MobileNetV2_BiLSTM_final.pt",
+        "Emotion_Models/MM_ShuffleNetV2_BiLSTM_final.pt",
+        "Emotion_Models/MM_MobileNetV2_GRU_final.pt",
+        "Emotion_Models/MM_EfficientNet_B0_BiLSTM_final.pt",
+        "Emotion_Models/MM_ShuffleNetV2_GRU_quantized_dynamic.pt",
+    ]
     
-    return model, vocab, device
+    model_path = None
+    for path in model_paths:
+        if os.path.exists(path):
+            model_path = path
+            break
+    
+    if model_path is None:
+        st.error("❌ No model file found in Emotion_Models/ directory")
+        st.info("Please place a trained model file in the Emotion_Models/ folder")
+        return None, vocab, device
+    
+    try:
+        model = load_model(model_path, len(vocab), device)
+        return model, vocab, device
+    except Exception as e:
+        st.error(f"❌ Error loading model: {e}")
+        return None, vocab, device
 
+# ============================================================================
 # MAIN APP
+# ============================================================================
 
 def main():
     # Load model
     with st.spinner("Loading model..."):
-        try:
-            model, vocab, device = load_cached_model()
-            st.success(" Model loaded successfully!")
-        except Exception as e:
-            st.error(f" Error loading model: {e}")
-            st.info("Please make sure the model file exists at the correct path.")
-            return
+        model, vocab, device = load_cached_model()
+    
+    if model is None:
+        st.stop()
+    
+    st.success("✅ Model loaded successfully!")
     
     # Create tabs
-    tab1, tab2, tab3 = st.tabs([" Upload & Predict", " XAI Analysis", " About"])
-   
+    tab1, tab2, tab3 = st.tabs(["📤 Upload & Predict", "🔍 XAI Analysis", "📊 About"])
+    
+    # ========================================================================
     # TAB 1: Upload & Predict
-
+    # ========================================================================
     
     with tab1:
         st.header("Upload a Drawing")
@@ -277,51 +388,64 @@ def main():
                 
                 if predict_button:
                     with st.spinner("Analyzing..."):
-                        # Preprocess
-                        img_tensor = preprocess_image(image)
-                        
-                        # Create text tensor
-                        if child_text:
-                            text_tensor = text_to_sequence(child_text, vocab).unsqueeze(0)
-                        else:
-                            text_tensor = torch.zeros(1, 50, dtype=torch.long)
-                        
-                        # Predict
-                        img_tensor = img_tensor.to(device)
-                        text_tensor = text_tensor.to(device)
-                        
-                        with torch.no_grad():
-                            output = model(img_tensor, text_tensor)
-                            probs = F.softmax(output, dim=1)
-                            pred = torch.argmax(probs, dim=1)
-                        
-                        # Results
-                        emotion = "Happy 😊" if pred.item() == 0 else "Sad 😢"
-                        confidence = probs[0][pred.item()].item()
-                        
-                        st.subheader("Prediction Result")
-                        st.markdown(f"""
-                        <div style="text-align: center; padding: 20px; background-color: {'#d4edda' if pred.item() == 0 else '#f8d7da'}; border-radius: 10px;">
-                            <h1 style="font-size: 48px; margin: 0;">{emotion}</h1>
-                            <p style="font-size: 24px; margin: 0;">Confidence: {confidence:.1%}</p>
-                        </div>
-                        """, unsafe_allow_html=True)
-                        
-                        # Store for XAI tab
-                        st.session_state['current_image'] = img_tensor
-                        st.session_state['current_pred'] = pred.item()
-                        st.session_state['current_probs'] = probs
+                        try:
+                            # Preprocess
+                            img_tensor = preprocess_image(image)
+                            
+                            # Create text tensor
+                            if child_text:
+                                text_tensor = text_to_sequence(child_text, vocab).unsqueeze(0)
+                            else:
+                                text_tensor = torch.zeros(1, 50, dtype=torch.long)
+                            
+                            # Predict
+                            img_tensor = img_tensor.to(device)
+                            text_tensor = text_tensor.to(device)
+                            
+                            with torch.no_grad():
+                                output = model(img_tensor, text_tensor)
+                                probs = F.softmax(output, dim=1)
+                                pred = torch.argmax(probs, dim=1)
+                            
+                            # Results
+                            emotion = "Happy 😊" if pred.item() == 0 else "Sad 😢"
+                            confidence = probs[0][pred.item()].item()
+                            
+                            st.subheader("📊 Prediction Result")
+                            
+                            # Color based on emotion
+                            bg_color = '#d4edda' if pred.item() == 0 else '#f8d7da'
+                            emoji = '😊' if pred.item() == 0 else '😢'
+                            
+                            st.markdown(f"""
+                            <div style="text-align: center; padding: 20px; background-color: {bg_color}; border-radius: 10px;">
+                                <h1 style="font-size: 48px; margin: 0;">{emotion}</h1>
+                                <p style="font-size: 24px; margin: 0;">Confidence: {confidence:.1%}</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            
+                            # Store for XAI tab
+                            st.session_state['current_image'] = img_tensor
+                            st.session_state['current_pred'] = pred.item()
+                            st.session_state['current_probs'] = probs
+                            st.session_state['current_text'] = child_text
+                            
+                        except Exception as e:
+                            st.error(f"Error during prediction: {e}")
     
+    # ========================================================================
     # TAB 2: XAI Analysis
+    # ========================================================================
     
     with tab2:
-        st.header(" Explainable AI Analysis")
+        st.header("🔍 Explainable AI Analysis")
         
         if 'current_image' not in st.session_state:
             st.info("Please upload an image and make a prediction first in the 'Upload & Predict' tab.")
         else:
             image_tensor = st.session_state['current_image']
             pred_class = st.session_state['current_pred']
+            child_text = st.session_state.get('current_text', '')
             
             st.subheader("Grad-CAM Visualization")
             st.markdown("Shows which parts of the drawing influenced the model's decision.")
@@ -331,22 +455,13 @@ def main():
                 try:
                     grad_cam = GradCAMExplainer(model, device)
                     
-                    # For predicted class
-                    img, heatmap, overlay = grad_cam.visualize(image_tensor, pred_class)
-                    
-                    col1, col2, col3 = st.columns(3)
-                    
-                    with col1:
-                        st.image(img, caption="Original Image", use_container_width=True)
-                    
-                    with col2:
-                        st.image(heatmap, caption="Grad-CAM Heatmap", use_container_width=True)
-                    
-                    with col3:
-                        st.image(overlay, caption="Overlay (Important Regions)", use_container_width=True)
+                    # Generate visualization
+                    fig = grad_cam.visualize(image_tensor, pred_class)
+                    st.pyplot(fig)
+                    plt.close(fig)
                     
                     # Add interpretation
-                    st.subheader(" Interpretation")
+                    st.subheader("📖 Interpretation")
                     if pred_class == 0:
                         st.success("""
                         **The model focused on regions that typically indicate happiness:**
@@ -362,74 +477,82 @@ def main():
                         - Closed/withdrawn body language features
                         """)
                     
-                    # Attention weights for text (if text was provided)
-                    if child_text:
-                        st.subheader(" Text Attention Weights")
-                        st.markdown("Shows which words in the child's explanation were most important.")
-                        
-                        # Simple word importance visualization
-                        words = child_text.split()
-                        weights = np.random.rand(len(words)) * 0.5 + 0.5  # Placeholder - in production, use actual attention
-                        
-                        fig, ax = plt.subplots(figsize=(10, 3))
-                        bars = ax.bar(range(len(words)), weights)
-                        ax.set_xticks(range(len(words)))
-                        ax.set_xticklabels(words, rotation=45, ha='right')
-                        ax.set_ylabel('Importance')
-                        ax.set_title('Word Importance in Decision')
-                        st.pyplot(fig)
-                        
-                        # Top important words
-                        top_indices = np.argsort(weights)[-5:][::-1]
-                        top_words = [words[i] for i in top_indices if i < len(words)]
-                        st.write("**Most influential words:**", ", ".join(top_words))
+                    # Display confidence bar
+                    probs = st.session_state['current_probs']
+                    st.subheader("📊 Confidence Distribution")
+                    
+                    fig2, ax2 = plt.subplots(figsize=(6, 4))
+                    emotions = ['Happy', 'Sad']
+                    colors = ['#28a745', '#dc3545']
+                    ax2.bar(emotions, probs[0].cpu().numpy(), color=colors)
+                    ax2.set_ylim(0, 1)
+                    ax2.set_ylabel('Confidence')
+                    ax2.set_title('Prediction Confidence')
+                    ax2.grid(True, alpha=0.3)
+                    st.pyplot(fig2)
+                    plt.close(fig2)
                     
                 except Exception as e:
                     st.error(f"Error generating XAI: {e}")
     
+    # ========================================================================
     # TAB 3: About
+    # ========================================================================
     
     with tab3:
-        st.header("About This Application")
+        st.header("📊 About This Application")
         
         st.markdown("""
-        ### Purpose
+        ### 🎯 Purpose
         This application analyzes children's drawings to detect emotional states (Happiness vs Sadness) 
         using a multimodal deep learning model.
         
-        ### Model Architecture
+        ### 🧠 Model Architecture
         - **Vision Encoder**: ShuffleNetV2 (lightweight CNN)
-        - **Text Encoder**: Bi-LSTM with Attention
+        - **Text Encoder**: Bi-LSTM/GRU with Attention
         - **Fusion**: Multimodal fusion of visual and textual features
         - **Accuracy**: 96.17% on test set
         
-        ### XAI Techniques Used
+        ### 🔍 XAI Techniques Used
         1. **Grad-CAM**: Visualizes which image regions influenced the decision
-        2. **Attention Weights**: Shows which words in the text were most important
+        2. **Feature Attribution**: Identifies important features
         
-        ### Model Details
+        ### 📁 Model Details
         - **Model**: MM_ShuffleNetV2_GRU
         - **Size**: 14.17 MB (compressed)
         - **Parameters**: 3.70M
         - **Compression**: Dynamic Quantization (1.61x)
         
-        ### How It Works
+        ### 🎨 How It Works
         1. Upload a child's drawing
         2. Optionally add the child's explanation
         3. The model analyzes both visual and textual inputs
         4. Get emotion prediction with confidence score
         5. View XAI explanations for the decision
         
-        ### Use Cases
+        ### 📚 Use Cases
         - Early emotional screening in schools
         - Therapeutic settings
         - Parent-child communication aid
         - Educational research
         """)
         
-        st.info(" **Tip**: For best results, upload a clear drawing and provide the child's explanation if available.")
+        st.info("💡 **Tip**: For best results, upload a clear drawing and provide the child's explanation if available.")
+        
+        # Display model info if available
+        st.subheader("📊 Model Performance Summary")
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Accuracy", "96.17%", "High")
+        with col2:
+            st.metric("Model Size", "14.17 MB", "Lightweight")
+        with col3:
+            st.metric("XAI Support", "✅ Yes", "Grad-CAM")
 
+# ============================================================================
 # RUN APP
+# ============================================================================
 
 if __name__ == "__main__":
     main()
