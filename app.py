@@ -1,5 +1,6 @@
 # ============================================================================
 # STREAMLIT APP: Emotion Detection from Children's Drawings with XAI
+# Using Quantized Model for Faster Inference
 # ============================================================================
 
 import streamlit as st
@@ -14,8 +15,6 @@ import re
 import matplotlib.pyplot as plt
 import seaborn as sns
 from captum.attr import LayerGradCam, LayerAttribution
-import json
-import pickle
 
 # ============================================================================
 # PAGE CONFIGURATION
@@ -52,35 +51,17 @@ class BiLSTMTextEncoder(nn.Module):
         context = torch.sum(attn_weights * lstm_out, dim=1)
         return context
 
-class GRUTextEncoder(nn.Module):
-    """GRU Text Encoder with Attention."""
-    def __init__(self, vocab_size, embed_dim=300, hidden=128, dropout=0.3):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.gru = nn.GRU(embed_dim, hidden, 2, bidirectional=True, 
-                         batch_first=True, dropout=dropout)
-        self.attention = nn.Linear(hidden * 2, 1)
-        self.dropout = nn.Dropout(dropout)
-        self.output_dim = hidden * 2
-        
-    def forward(self, x):
-        embedded = self.dropout(self.embedding(x))
-        gru_out, _ = self.gru(embedded)
-        attn_weights = torch.softmax(self.attention(gru_out), dim=1)
-        context = torch.sum(attn_weights * gru_out, dim=1)
-        return context
-
 def get_vision_encoder(name, pretrained=False):
     """Get vision backbone with feature dimension."""
     import torchvision.models as models
     backbones = {
-        'shufflenet_v2_x1_0': (models.shufflenet_v2_x1_0, 1024),
-        'mobilenet_v2': (models.mobilenet_v2, 1280),
         'efficientnet_b0': (models.efficientnet_b0, 1280),
+        'mobilenet_v2': (models.mobilenet_v2, 1280),
+        'shufflenet_v2_x1_0': (models.shufflenet_v2_x1_0, 1024),
     }
     
     if name not in backbones:
-        model_fn, dim = backbones['shufflenet_v2_x1_0']
+        model_fn, dim = backbones['efficientnet_b0']
     else:
         model_fn, dim = backbones[name]
     
@@ -138,76 +119,97 @@ class MultimodalModel(nn.Module):
         return self.classifier(fused)
 
 # ============================================================================
-# LOAD MODEL AND VOCABULARY FROM CHECKPOINT
+# LOAD MODEL AND VOCABULARY
 # ============================================================================
+
+# Default vocabulary (will be replaced by checkpoint vocab if available)
+def create_default_vocab():
+    vocab = {'<PAD>': 0, '<UNK>': 1}
+    common_words = [
+        'happy', 'sad', 'draw', 'feel', 'like', 'love', 'cry', 'smile', 
+        'angry', 'scared', 'excited', 'tired', 'bored', 'lonely', 'fun',
+        'play', 'friend', 'family', 'school', 'home', 'dog', 'cat', 'sun',
+        'rain', 'because', 'very', 'really', 'want', 'think', 'know', 'see',
+        'look', 'good', 'bad', 'nice', 'great', 'wonderful', 'terrible', 'awful',
+        'beautiful', 'ugly', 'big', 'small', 'little', 'much', 'many', 'more',
+        'most', 'some', 'any', 'all', 'every', 'people', 'child', 'mother',
+        'father', 'brother', 'sister', 'friend', 'teacher', 'school', 'home'
+    ]
+    for i, word in enumerate(common_words, 2):
+        vocab[word] = i
+    return vocab
 
 def load_model_and_vocab(model_path, device):
     """
     Load model and vocabulary from checkpoint.
-    This ensures the vocabulary size matches the saved model.
     """
-    # First, load the checkpoint to get vocabulary
+    # First, load the checkpoint to get vocabulary and weights
     checkpoint = torch.load(model_path, map_location=device)
     
-    # Check if vocabulary is in checkpoint
+    # Get vocabulary from checkpoint or use default
     if 'vocab' in checkpoint:
         vocab = checkpoint['vocab']
         vocab_size = len(vocab)
         print(f"✅ Loaded vocabulary from checkpoint: {vocab_size} words")
     else:
-        # Fallback: try to load from saved file
-        vocab_path = model_path.replace('_final.pt', '_vocab.json')
-        if os.path.exists(vocab_path):
-            with open(vocab_path, 'r') as f:
-                vocab = json.load(f)
-            vocab_size = len(vocab)
+        # Try to get vocab size from embedding weights
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        embedding_weight = state_dict.get('text_encoder.embedding.weight')
+        if embedding_weight is not None:
+            vocab_size = embedding_weight.shape[0]
+            print(f"✅ Using vocab size from embedding: {vocab_size}")
+            vocab = {str(i): i for i in range(vocab_size)}
         else:
-            # Create vocabulary from checkpoint keys if possible
-            state_dict = checkpoint['model_state_dict']
-            embedding_weight = state_dict.get('text_encoder.embedding.weight')
-            if embedding_weight is not None:
-                vocab_size = embedding_weight.shape[0]
-                print(f"✅ Using vocab size from embedding: {vocab_size}")
-                # Create dummy vocab
-                vocab = {str(i): i for i in range(vocab_size)}
-            else:
-                # Last resort: use a large vocab size
-                vocab_size = 10000
-                vocab = {str(i): i for i in range(vocab_size)}
+            vocab = create_default_vocab()
+            vocab_size = len(vocab)
+            print(f"✅ Using default vocabulary: {vocab_size} words")
     
-    # Detect model type from checkpoint
-    state_dict = checkpoint['model_state_dict']
+    # Detect text encoder type
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
     is_gru = any('text_encoder.gru' in k for k in state_dict.keys())
-    is_lstm = any('text_encoder.lstm' in k for k in state_dict.keys())
     
-    # Create appropriate text encoder
+    # Create text encoder
     if is_gru:
         text_encoder = GRUTextEncoder(vocab_size)
     else:
         text_encoder = BiLSTMTextEncoder(vocab_size)
     
-    # Detect vision backbone
-    if 'efficient' in model_path.lower() or 'efficient' in str(state_dict.keys()):
-        vision_name = 'efficientnet_b0'
-    elif 'shuffle' in model_path.lower():
-        vision_name = 'shufflenet_v2_x1_0'
-    else:
-        vision_name = 'mobilenet_v2'
-    
-    # Create model
-    model = MultimodalModel(vision_name, text_encoder)
+    # Create model with EfficientNet-B0
+    model = MultimodalModel('efficientnet_b0', text_encoder)
     
     # Load weights
-    try:
-        model.load_state_dict(state_dict, strict=False)
-        print("✅ Model weights loaded successfully")
-    except Exception as e:
-        print(f"⚠️ Some weights not loaded: {e}")
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    else:
+        model.load_state_dict(checkpoint, strict=False)
     
     model.to(device)
     model.eval()
     
+    print(f"✅ Model loaded successfully")
     return model, vocab
+
+# ============================================================================
+# GRU Text Encoder (for compatibility)
+# ============================================================================
+
+class GRUTextEncoder(nn.Module):
+    """GRU Text Encoder with Attention."""
+    def __init__(self, vocab_size, embed_dim=300, hidden=128, dropout=0.3):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.gru = nn.GRU(embed_dim, hidden, 2, bidirectional=True, 
+                         batch_first=True, dropout=dropout)
+        self.attention = nn.Linear(hidden * 2, 1)
+        self.dropout = nn.Dropout(dropout)
+        self.output_dim = hidden * 2
+        
+    def forward(self, x):
+        embedded = self.dropout(self.embedding(x))
+        gru_out, _ = self.gru(embedded)
+        attn_weights = torch.softmax(self.attention(gru_out), dim=1)
+        context = torch.sum(attn_weights * gru_out, dim=1)
+        return context
 
 # ============================================================================
 # PREPROCESSING FUNCTIONS
@@ -223,7 +225,6 @@ def preprocess_text(text, max_len=50):
 def text_to_sequence(text, vocab, max_len=50):
     """
     Convert text to token sequence using the loaded vocabulary.
-    Handles unknown words by mapping to <UNK> token (index 1).
     """
     tokens = preprocess_text(text).split()[:max_len]
     seq = []
@@ -231,9 +232,8 @@ def text_to_sequence(text, vocab, max_len=50):
         if token in vocab:
             seq.append(vocab[token])
         else:
-            seq.append(vocab.get('<UNK>', 1))  # Default to 1 (UNK)
+            seq.append(vocab.get('<UNK>', 1))
     
-    # Pad to max_len
     seq += [0] * (max_len - len(seq))
     return torch.tensor(seq, dtype=torch.long)
 
@@ -329,32 +329,26 @@ def load_cached_model():
     """Load model with caching."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Check for model files in order of preference
-    model_paths = [
-        "Emotion_Models/MM_ShuffleNetV2_GRU_final.pt",
-        "Emotion_Models/MM_MobileNetV2_BiLSTM_final.pt",
-        "Emotion_Models/MM_ShuffleNetV2_BiLSTM_final.pt",
-        "Emotion_Models/MM_MobileNetV2_GRU_final.pt",
+    # Use the quantized model
+    model_path = "Emotion_Models/MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt"
+    
+    # Fallback to other models if quantized not found
+    fallback_paths = [
         "Emotion_Models/MM_EfficientNet_B0_BiLSTM_final.pt",
-        "Emotion_Models/MM_ShuffleNetV2_GRU_quantized_dynamic.pt",
-        "Emotion_Models/MM_ShuffleNetV2_GRU_mixed_precision.pt",
+        "Emotion_Models/MM_MobileNetV2_BiLSTM_final.pt",
+        "Emotion_Models/MM_ShuffleNetV2_GRU_final.pt",
     ]
     
-    model_path = None
-    for path in model_paths:
-        if os.path.exists(path):
-            model_path = path
-            break
+    if not os.path.exists(model_path):
+        st.warning(f"⚠️ Quantized model not found at: {model_path}")
+        st.info("Looking for fallback models...")
+        for path in fallback_paths:
+            if os.path.exists(path):
+                model_path = path
+                st.info(f"✅ Using fallback model: {os.path.basename(path)}")
+                break
     
-    if model_path is None:
-        # Check if there's any .pt file in Emotion_Models
-        if os.path.exists("Emotion_Models"):
-            files = [f for f in os.listdir("Emotion_Models") if f.endswith('.pt')]
-            if files:
-                model_path = os.path.join("Emotion_Models", files[0])
-                st.info(f"✅ Found model: {files[0]}")
-    
-    if model_path is None:
+    if not os.path.exists(model_path):
         st.error("❌ No model file found in Emotion_Models/ directory")
         st.info("Please place a trained model file in the Emotion_Models/ folder")
         return None, None, device
@@ -362,7 +356,11 @@ def load_cached_model():
     try:
         with st.spinner(f"Loading model from {os.path.basename(model_path)}..."):
             model, vocab = load_model_and_vocab(model_path, device)
-            st.success(f"✅ Model loaded successfully from {os.path.basename(model_path)}!")
+            
+            # Get model size
+            model_size = os.path.getsize(model_path) / (1024 * 1024)
+            
+            st.success(f"✅ Model loaded successfully! ({model_size:.2f} MB)")
             return model, vocab, device
     except Exception as e:
         st.error(f"❌ Error loading model: {e}")
@@ -433,16 +431,15 @@ def main():
                             with torch.no_grad():
                                 output = model(img_tensor, text_tensor)
                                 probs = F.softmax(output, dim=1)
-                                pred = torch.argmax(probs, dim=1)
+                                pred = torch.argmax(probs, dim=1).item()
                             
                             # Results
-                            emotion = "Happy 😊" if pred.item() == 0 else "Sad 😢"
-                            confidence = probs[0][pred.item()].item()
+                            emotion = "Happy 😊" if pred == 0 else "Sad 😢"
+                            confidence = probs[0][pred].item()
                             
                             st.subheader("📊 Prediction Result")
                             
-                            # Color based on emotion
-                            bg_color = '#d4edda' if pred.item() == 0 else '#f8d7da'
+                            bg_color = '#d4edda' if pred == 0 else '#f8d7da'
                             
                             st.markdown(f"""
                             <div style="text-align: center; padding: 20px; background-color: {bg_color}; border-radius: 10px;">
@@ -453,7 +450,7 @@ def main():
                             
                             # Store for XAI tab
                             st.session_state['current_image'] = img_tensor
-                            st.session_state['current_pred'] = pred.item()
+                            st.session_state['current_pred'] = pred
                             st.session_state['current_probs'] = probs
                             st.session_state['current_text'] = child_text
                             
@@ -531,19 +528,19 @@ def main():
         using a multimodal deep learning model.
         
         ### 🧠 Model Architecture
-        - **Vision Encoder**: ShuffleNetV2 / MobileNetV2 / EfficientNet-B0
-        - **Text Encoder**: Bi-LSTM / GRU with Attention
+        - **Vision Encoder**: EfficientNet-B0 (Quantized)
+        - **Text Encoder**: Bi-LSTM with Attention
         - **Fusion**: Multimodal fusion of visual and textual features
-        - **Accuracy**: 96.17% on test set
+        - **Compression**: Dynamic Quantization (1.35x smaller)
         
         ### 🔍 XAI Techniques Used
         1. **Grad-CAM**: Visualizes which image regions influenced the decision
         
         ### 📁 Model Details
-        - **Model**: MM_ShuffleNetV2_GRU
-        - **Size**: 14.17 MB (compressed)
-        - **Parameters**: 3.70M
-        - **Compression**: Dynamic Quantization (1.61x)
+        - **Model**: MM_EfficientNet_B0_BiLSTM (Quantized)
+        - **Size**: ~19 MB (compressed)
+        - **Compression**: Dynamic Quantization
+        - **Accuracy**: 95.88%
         
         ### 🎨 How It Works
         1. Upload a child's drawing
