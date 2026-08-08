@@ -142,9 +142,11 @@ def create_default_vocab():
 def load_model_and_vocab(model_path, device):
     """
     Load model and vocabulary from checkpoint.
+    FIXED: Using weights_only=False for compatibility with PyTorch 2.6+
     """
-    # First, load the checkpoint to get vocabulary and weights
-    checkpoint = torch.load(model_path, map_location=device)
+    # Load checkpoint with weights_only=False for compatibility
+    # This is safe because we trust the source of the model file
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     
     # Get vocabulary from checkpoint or use default
     if 'vocab' in checkpoint:
@@ -364,6 +366,8 @@ def load_cached_model():
             return model, vocab, device
     except Exception as e:
         st.error(f"❌ Error loading model: {e}")
+        import traceback
+        st.code(traceback.format_exc())
         return None, None, device
 
 # ============================================================================
