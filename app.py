@@ -364,7 +364,7 @@ def main():
         st.stop()
     
     # Create tabs
-    tab1, tab2, tab3 = st.tabs(["📤 Upload & Predict", "🔍 XAI Analysis", "📊 About"])
+    tab1, tab2, tab3 = st.tabs([" Upload & Predict", " XAI Analysis", " About"])
     
     # TAB 1: Upload & Predict
     
@@ -389,7 +389,7 @@ def main():
                 help="Entering the child's explanation improves accuracy"
             )
             
-            predict_button = st.button("🔮 Predict Emotion", type="primary", use_container_width=True)
+            predict_button = st.button(" Predict Emotion", type="primary", use_container_width=True)
         
         with col2:
             if uploaded_file is not None:
