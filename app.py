@@ -346,7 +346,7 @@ def load_cached_model():
             # Get model size
             model_size = os.path.getsize(model_path) / (1024 * 1024)
             
-            st.success(f" Model loaded successfully! ({model_size:.2f} MB)")
+        
             return model, vocab, device
     except Exception as e:
         st.error(f" Error loading model: {e}")
