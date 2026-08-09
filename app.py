@@ -1,7 +1,5 @@
-# ============================================================================
 # STREAMLIT APP: Emotion Detection from Children's Drawings with XAI
 # Using Quantized Model for Faster Inference
-# ============================================================================
 
 import streamlit as st
 import torch
@@ -16,9 +14,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from captum.attr import LayerGradCam, LayerAttribution
 
-# ============================================================================
 # PAGE CONFIGURATION
-# ============================================================================
 
 st.set_page_config(
     page_title="Emotion Detection from Drawings",
@@ -29,9 +25,8 @@ st.set_page_config(
 st.title("🎨 Emotion Detection from Children's Drawings")
 st.markdown("Upload a drawing to detect if it expresses **Happiness** or **Sadness**")
 
-# ============================================================================
-# MODEL ARCHITECTURE (Matching the trained model)
-# ============================================================================
+# MODEL ARCHITECTURE 
+
 
 class BiLSTMTextEncoder(nn.Module):
     """Bi-LSTM Text Encoder with Attention."""
@@ -118,9 +113,7 @@ class MultimodalModel(nn.Module):
         fused = torch.cat([v, t], dim=1)
         return self.classifier(fused)
 
-# ============================================================================
 # LOAD MODEL AND VOCABULARY
-# ============================================================================
 
 # Default vocabulary (will be replaced by checkpoint vocab if available)
 def create_default_vocab():
@@ -152,19 +145,19 @@ def load_model_and_vocab(model_path, device):
     if 'vocab' in checkpoint:
         vocab = checkpoint['vocab']
         vocab_size = len(vocab)
-        print(f"✅ Loaded vocabulary from checkpoint: {vocab_size} words")
+        print(f" Loaded vocabulary from checkpoint: {vocab_size} words")
     else:
         # Try to get vocab size from embedding weights
         state_dict = checkpoint.get('model_state_dict', checkpoint)
         embedding_weight = state_dict.get('text_encoder.embedding.weight')
         if embedding_weight is not None:
             vocab_size = embedding_weight.shape[0]
-            print(f"✅ Using vocab size from embedding: {vocab_size}")
+            print(f" Using vocab size from embedding: {vocab_size}")
             vocab = {str(i): i for i in range(vocab_size)}
         else:
             vocab = create_default_vocab()
             vocab_size = len(vocab)
-            print(f"✅ Using default vocabulary: {vocab_size} words")
+            print(f" Using default vocabulary: {vocab_size} words")
     
     # Detect text encoder type
     state_dict = checkpoint.get('model_state_dict', checkpoint)
@@ -188,12 +181,10 @@ def load_model_and_vocab(model_path, device):
     model.to(device)
     model.eval()
     
-    print(f"✅ Model loaded successfully")
+    print(f" Model loaded successfully")
     return model, vocab
 
-# ============================================================================
-# GRU Text Encoder (for compatibility)
-# ============================================================================
+# GRU Text Encoder 
 
 class GRUTextEncoder(nn.Module):
     """GRU Text Encoder with Attention."""
@@ -213,9 +204,7 @@ class GRUTextEncoder(nn.Module):
         context = torch.sum(attn_weights * gru_out, dim=1)
         return context
 
-# ============================================================================
 # PREPROCESSING FUNCTIONS
-# ============================================================================
 
 def preprocess_text(text, max_len=50):
     """Preprocess text for the model."""
@@ -247,9 +236,7 @@ def preprocess_image(image):
     ])
     return transform(image).unsqueeze(0)
 
-# ============================================================================
 # XAI FUNCTIONS
-# ============================================================================
 
 class GradCAMExplainer:
     """Grad-CAM explainer for the model."""
@@ -322,9 +309,7 @@ class GradCAMExplainer:
         plt.tight_layout()
         return fig
 
-# ============================================================================
 # LOAD MODEL
-# ============================================================================
 
 @st.cache_resource
 def load_cached_model():
@@ -342,16 +327,16 @@ def load_cached_model():
     ]
     
     if not os.path.exists(model_path):
-        st.warning(f"⚠️ Quantized model not found at: {model_path}")
+        st.warning(f" Quantized model not found at: {model_path}")
         st.info("Looking for fallback models...")
         for path in fallback_paths:
             if os.path.exists(path):
                 model_path = path
-                st.info(f"✅ Using fallback model: {os.path.basename(path)}")
+                st.info(f" Using fallback model: {os.path.basename(path)}")
                 break
     
     if not os.path.exists(model_path):
-        st.error("❌ No model file found in Emotion_Models/ directory")
+        st.error(" No model file found in Emotion_Models/ directory")
         st.info("Please place a trained model file in the Emotion_Models/ folder")
         return None, None, device
     
@@ -362,17 +347,15 @@ def load_cached_model():
             # Get model size
             model_size = os.path.getsize(model_path) / (1024 * 1024)
             
-            st.success(f"✅ Model loaded successfully! ({model_size:.2f} MB)")
+            st.success(f" Model loaded successfully! ({model_size:.2f} MB)")
             return model, vocab, device
     except Exception as e:
-        st.error(f"❌ Error loading model: {e}")
+        st.error(f" Error loading model: {e}")
         import traceback
         st.code(traceback.format_exc())
         return None, None, device
 
-# ============================================================================
 # MAIN APP
-# ============================================================================
 
 def main():
     # Load model
@@ -384,9 +367,7 @@ def main():
     # Create tabs
     tab1, tab2, tab3 = st.tabs(["📤 Upload & Predict", "🔍 XAI Analysis", "📊 About"])
     
-    # ========================================================================
     # TAB 1: Upload & Predict
-    # ========================================================================
     
     with tab1:
         st.header("Upload a Drawing")
@@ -438,10 +419,10 @@ def main():
                                 pred = torch.argmax(probs, dim=1).item()
                             
                             # Results
-                            emotion = "Happy 😊" if pred == 0 else "Sad 😢"
+                            emotion = "Happy " if pred == 0 else "Sad "
                             confidence = probs[0][pred].item()
                             
-                            st.subheader("📊 Prediction Result")
+                            st.subheader(" Prediction Result")
                             
                             bg_color = '#d4edda' if pred == 0 else '#f8d7da'
                             
@@ -461,12 +442,10 @@ def main():
                         except Exception as e:
                             st.error(f"Error during prediction: {e}")
     
-    # ========================================================================
     # TAB 2: XAI Analysis
-    # ========================================================================
     
     with tab2:
-        st.header("🔍 Explainable AI Analysis")
+        st.header(" Explainable AI Analysis")
         
         if 'current_image' not in st.session_state:
             st.info("Please upload an image and make a prediction first in the 'Upload & Predict' tab.")
@@ -485,7 +464,7 @@ def main():
                     plt.close(fig)
                     
                     # Interpretation
-                    st.subheader("📖 Interpretation")
+                    st.subheader(" Interpretation")
                     if pred_class == 0:
                         st.success("""
                         **The model focused on regions that typically indicate happiness:**
@@ -503,7 +482,7 @@ def main():
                     
                     # Confidence bar
                     probs = st.session_state['current_probs']
-                    st.subheader("📊 Confidence Distribution")
+                    st.subheader(" Confidence Distribution")
                     
                     fig2, ax2 = plt.subplots(figsize=(6, 4))
                     emotions = ['Happy', 'Sad']
@@ -518,53 +497,49 @@ def main():
                     
                 except Exception as e:
                     st.error(f"Error generating XAI: {e}")
-    
-    # ========================================================================
+
     # TAB 3: About
-    # ========================================================================
     
     with tab3:
-        st.header("📊 About This Application")
+        st.header(" About This Application")
         
         st.markdown("""
-        ### 🎯 Purpose
+        ###  Purpose
         This application analyzes children's drawings to detect emotional states (Happiness vs Sadness) 
         using a multimodal deep learning model.
         
-        ### 🧠 Model Architecture
+        ###  Model Architecture
         - **Vision Encoder**: EfficientNet-B0 (Quantized)
         - **Text Encoder**: Bi-LSTM with Attention
         - **Fusion**: Multimodal fusion of visual and textual features
         - **Compression**: Dynamic Quantization (1.35x smaller)
         
-        ### 🔍 XAI Techniques Used
+        ###  XAI Techniques Used
         1. **Grad-CAM**: Visualizes which image regions influenced the decision
         
-        ### 📁 Model Details
+        ###  Model Details
         - **Model**: MM_EfficientNet_B0_BiLSTM (Quantized)
         - **Size**: ~19 MB (compressed)
         - **Compression**: Dynamic Quantization
         - **Accuracy**: 95.88%
         
-        ### 🎨 How It Works
+        ###  How It Works
         1. Upload a child's drawing
         2. Optionally add the child's explanation
         3. The model analyzes both visual and textual inputs
         4. Get emotion prediction with confidence score
         5. View XAI explanations for the decision
         
-        ### 📚 Use Cases
+        ###  Use Cases
         - Early emotional screening in schools
         - Therapeutic settings
         - Parent-child communication aid
         - Educational research
         """)
         
-        st.info("💡 **Tip**: For best results, upload a clear drawing and provide the child's explanation if available.")
+        st.info(" **Tip**: For best results, upload a clear drawing and provide the child's explanation if available.")
 
-# ============================================================================
 # RUN APP
-# ============================================================================
 
 if __name__ == "__main__":
     main()
