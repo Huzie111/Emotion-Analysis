@@ -180,8 +180,7 @@ def load_model_and_vocab(model_path, device):
     
     model.to(device)
     model.eval()
-    
-    print(f" Model loaded successfully")
+
     return model, vocab
 
 # GRU Text Encoder 
