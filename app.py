@@ -39,7 +39,7 @@ st.markdown("---")
 # Replace this with your actual Google Drive File ID
 # Example: If your URL is https://drive.google.com/file/d/abc123xyz/view
 # Then FILE_ID = "abc123xyz"
-FILE_ID = "YOUR_FILE_ID_HERE"  # ← UPDATE THIS!
+FILE_ID = "1f8Ruzcy_7RfEzcEBDCnSQWAeOqs59hjZ"  # ← UPDATE THIS!
 
 # ============================================================================
 # MODEL ARCHITECTURE
