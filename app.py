@@ -1,5 +1,6 @@
+# ============================================================================
 # STREAMLIT APP: Emotion Detection with Layer-wise Grad-CAM
-
+# ============================================================================
 
 import streamlit as st
 import torch
@@ -9,27 +10,29 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from torchvision import transforms
 from captum.attr import LayerGradCam, LayerAttribution
-import cv2
 import os
 import io
 import base64
+import re
 from datetime import datetime
 
-
+# ============================================================================
 # PAGE CONFIGURATION
-
+# ============================================================================
 
 st.set_page_config(
     page_title="Emotion Detection from Children's Drawings",
-    page_icon="",
+    page_icon="🎨",
     layout="wide"
 )
 
-st.title("Emotion Detection from Children's Drawings")
+st.title("🎨 Emotion Detection from Children's Drawings")
 st.markdown("Upload a drawing to detect if it expresses **Happiness** or **Sadness**")
 st.markdown("---")
 
+# ============================================================================
 # MODEL ARCHITECTURE
+# ============================================================================
 
 class BiLSTMTextEncoder(nn.Module):
     def __init__(self, vocab_size=3423, embed_dim=300, hidden=128, dropout=0.3):
@@ -104,7 +107,9 @@ class MultimodalModel(nn.Module):
         fused = torch.cat([v, t], dim=1)
         return self.classifier(fused)
 
+# ============================================================================
 # VOCABULARY
+# ============================================================================
 
 def create_vocab():
     vocab = {'<PAD>': 0, '<UNK>': 1}
@@ -129,9 +134,9 @@ def text_to_sequence(text, vocab, max_len=50):
     seq += [0] * (max_len - len(seq))
     return torch.tensor(seq, dtype=torch.long)
 
+# ============================================================================
 # LOAD MODEL
-
-import re
+# ============================================================================
 
 @st.cache_resource
 def load_cached_model():
@@ -150,7 +155,7 @@ def load_cached_model():
             break
     
     if model_path is None:
-        st.error(" Model file not found!")
+        st.error("❌ Model file not found!")
         return None, None, device
     
     try:
@@ -163,15 +168,16 @@ def load_cached_model():
         model.to(device)
         model.eval()
         
-        st.success(f" Model loaded from {os.path.basename(model_path)}")
+        st.success(f"✅ Model loaded from {os.path.basename(model_path)}")
         return model, vocab, device
         
     except Exception as e:
-        st.error(f" Error loading model: {e}")
+        st.error(f"❌ Error loading model: {e}")
         return None, None, device
 
-
-# GRAD-CAM FUNCTIONS
+# ============================================================================
+# GRAD-CAM FUNCTIONS (NO OPENCV)
+# ============================================================================
 
 def get_target_layer(model):
     """Find the last convolutional layer."""
@@ -214,7 +220,6 @@ def get_layerwise_layers(model):
     if hasattr(vision, 'features'):
         if hasattr(vision.features, '_modules'):
             keys = list(vision.features._modules.keys())
-            # Select layers at different depths
             selected_indices = [0, len(keys)//4, len(keys)//2, 3*len(keys)//4, -1]
             for idx in selected_indices:
                 if abs(idx) < len(keys):
@@ -223,7 +228,6 @@ def get_layerwise_layers(model):
                         layers.append(module)
                         layer_names.append(f"Layer {keys[idx]}")
     
-    # If not enough layers found, find Conv2d layers
     if len(layers) < 3:
         for name, module in vision.named_modules():
             if isinstance(module, nn.Conv2d):
@@ -240,7 +244,6 @@ def generate_gradcam_heatmap(model, image, target_class, layer_idx=0):
     
     target_layer = get_target_layer(model)
     
-    # If layer_idx is specified and we have multiple layers
     if layer_idx > 0:
         layers, layer_names = get_layerwise_layers(model)
         if layer_idx <= len(layers):
@@ -284,7 +287,7 @@ def generate_layerwise_gradcam(model, image, target_class):
             attributions = attributions.unsqueeze(1)
             heatmap = LayerAttribution.interpolate(attributions, (224, 224))
         else:
-            heatmap = torch.ones(1, 1, 224, 224).to(next(model.parameters()).device)
+            heatmap = torch.ones(1, 1, 224, 224).to(device)
         
         heatmap = heatmap.squeeze().cpu().detach().numpy()
         heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
@@ -292,8 +295,38 @@ def generate_layerwise_gradcam(model, image, target_class):
     
     return heatmaps, layer_names
 
-def overlay_heatmap(image, heatmap, alpha=0.5):
-    """Overlay heatmap on image."""
+def overlay_heatmap_pil(image, heatmap, alpha=0.5):
+    """
+    Overlay heatmap on image using PIL (NO OPENCV).
+    """
+    # Convert image to numpy
+    if isinstance(image, torch.Tensor):
+        img = image.squeeze().cpu().permute(1, 2, 0).numpy()
+        img = np.clip(img, 0, 1)
+    else:
+        img = image
+    
+    # Resize heatmap to match image
+    from PIL import Image as PILImage
+    heatmap_resized = np.array(PILImage.fromarray(heatmap).resize((img.shape[1], img.shape[0])))
+    
+    # Create overlay using PIL
+    overlay = np.zeros_like(img)
+    
+    # Apply heatmap as color overlay
+    for i in range(3):
+        overlay[:, :, i] = img[:, :, i] * (1 - alpha) + heatmap_resized * alpha
+    
+    # Add red tint for high activation areas
+    overlay[:, :, 0] = np.maximum(overlay[:, :, 0], heatmap_resized * 0.8)
+    
+    return np.clip(overlay, 0, 1)
+
+def overlay_heatmap_jet(image, heatmap, alpha=0.5):
+    """
+    Overlay heatmap with jet colormap using matplotlib (NO OPENCV).
+    """
+    # Convert image to numpy
     if isinstance(image, torch.Tensor):
         img = image.squeeze().cpu().permute(1, 2, 0).numpy()
         img = np.clip(img, 0, 1)
@@ -301,17 +334,21 @@ def overlay_heatmap(image, heatmap, alpha=0.5):
         img = image
     
     # Resize heatmap
-    heatmap_resized = cv2.resize(heatmap, (img.shape[1], img.shape[0]))
-    heatmap_color = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
-    heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+    from PIL import Image as PILImage
+    heatmap_resized = np.array(PILImage.fromarray(heatmap).resize((img.shape[1], img.shape[0])))
+    
+    # Create jet colormap overlay
+    cmap = plt.cm.jet(heatmap_resized)
+    heatmap_color = cmap[:, :, :3]
     
     # Overlay
-    img_uint8 = np.uint8(255 * img)
-    overlay = cv2.addWeighted(img_uint8, 1 - alpha, heatmap_color, alpha, 0)
-    return overlay / 255.0
+    overlay = img * (1 - alpha) + heatmap_color * alpha
+    
+    return np.clip(overlay, 0, 1)
 
-
+# ============================================================================
 # DISPLAY FUNCTIONS
+# ============================================================================
 
 def normalize_image(tensor):
     """Normalize image tensor for display."""
@@ -323,9 +360,9 @@ def normalize_image(tensor):
     img = np.clip(img, 0, 1)
     return img
 
-
+# ============================================================================
 # MAIN APP
-
+# ============================================================================
 
 def main():
     # Load model
@@ -335,9 +372,11 @@ def main():
         st.stop()
     
     # Create tabs
-    tab1, tab2 = st.tabs(["Upload & Predict", "Layer-wise XAI", "About"])
+    tab1, tab2, tab3 = st.tabs(["📤 Upload & Predict", "🔍 Layer-wise XAI", "📊 About"])
     
+    # ========================================================================
     # TAB 1: Upload & Predict
+    # ========================================================================
     
     with tab1:
         st.header("Upload a Drawing")
@@ -358,7 +397,7 @@ def main():
                 height=80
             )
             
-            predict_button = st.button(" Predict Emotion", type="primary", use_container_width=True)
+            predict_button = st.button("🔮 Predict Emotion", type="primary", use_container_width=True)
         
         with col2:
             if uploaded_file is not None:
@@ -388,10 +427,10 @@ def main():
                                 pred = torch.argmax(probs, dim=1).item()
                             
                             # Results
-                            emotion = "Happy" if pred == 0 else "Sad"
+                            emotion = "Happy 😊" if pred == 0 else "Sad 😢"
                             confidence = probs[0][pred].item()
                             
-                            st.subheader(" Prediction Result")
+                            st.subheader("📊 Prediction Result")
                             
                             bg_color = '#d4edda' if pred == 0 else '#f8d7da'
                             
@@ -411,11 +450,12 @@ def main():
                         except Exception as e:
                             st.error(f"Error during prediction: {e}")
     
-
+    # ========================================================================
     # TAB 2: Layer-wise XAI
+    # ========================================================================
     
     with tab2:
-        st.header(" Layer-wise Grad-CAM Explanation")
+        st.header("🔍 Layer-wise Grad-CAM Explanation")
         st.markdown("Shows which parts of the drawing influenced the model's decision at different network layers.")
         
         if 'current_image' not in st.session_state:
@@ -458,8 +498,8 @@ def main():
                     # Normalize image
                     img_display = normalize_image(image_tensor)
                     
-                    # Create overlay
-                    overlay = overlay_heatmap(img_display, heatmap, alpha)
+                    # Create overlay using matplotlib (NO OPENCV)
+                    overlay = overlay_heatmap_jet(img_display, heatmap, alpha)
                     
                     # Display
                     col1, col2, col3 = st.columns(3)
@@ -473,8 +513,9 @@ def main():
                     with col3:
                         st.image(overlay, caption="Overlay", use_container_width=True)
                     
-
+                    # ============================================================
                     # Layer-wise Grid (All Layers)
+                    # ============================================================
                     
                     st.subheader("Layer-wise Grad-CAM Grid")
                     st.markdown("All layers side-by-side for comparison")
@@ -498,13 +539,14 @@ def main():
                         
                         for i, (col, hm, name) in enumerate(zip(cols_overlay, heatmaps, layer_names)):
                             with col:
-                                overlay_hm = overlay_heatmap(img_display, hm, alpha)
+                                overlay_hm = overlay_heatmap_jet(img_display, hm, alpha)
                                 st.image(overlay_hm, caption=f"{name[:12]}", use_container_width=True)
-
-                    # Interpretation
-
                     
-                    st.subheader(" Interpretation")
+                    # ============================================================
+                    # Interpretation
+                    # ============================================================
+                    
+                    st.subheader("📖 Interpretation")
                     
                     # Determine which layer shows the most focused regions
                     focus_scores = []
@@ -533,11 +575,12 @@ def main():
                         - Closed/withdrawn body language features
                         - The early layers capture basic shapes, while later layers capture semantic features
                         """)
-
-                    # Download Button
-
                     
-                    st.subheader(" Export Explanation")
+                    # ============================================================
+                    # Download Button
+                    # ============================================================
+                    
+                    st.subheader("📥 Export Explanation")
                     
                     # Create a combined figure
                     fig, axes = plt.subplots(2, len(heatmaps) + 1, figsize=(20, 8))
@@ -559,7 +602,7 @@ def main():
                     axes[1, 0].axis('off')
                     
                     for i, (hm, name) in enumerate(zip(heatmaps, layer_names)):
-                        overlay_hm = overlay_heatmap(img_display, hm, alpha)
+                        overlay_hm = overlay_heatmap_jet(img_display, hm, alpha)
                         axes[1, i+1].imshow(overlay_hm)
                         axes[1, i+1].set_title(name[:12])
                         axes[1, i+1].axis('off')
@@ -573,7 +616,7 @@ def main():
                     buf.seek(0)
                     
                     st.download_button(
-                        label=" Download Layer-wise Grad-CAM",
+                        label="📥 Download Layer-wise Grad-CAM",
                         data=buf.getvalue(),
                         file_name=f"layerwise_gradcam_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
                         mime="image/png"
@@ -585,43 +628,44 @@ def main():
                     import traceback
                     st.code(traceback.format_exc())
     
-    
+    # ========================================================================
     # TAB 3: About
+    # ========================================================================
     
     with tab3:
-        st.header(" About This Application")
+        st.header("📊 About This Application")
         
         st.markdown("""
-        ###  Purpose
+        ### 🎯 Purpose
         This application analyzes children's drawings to detect emotional states (Happiness vs Sadness) 
         using a multimodal deep learning model with layer-wise explainable AI.
         
-        ###  Model Architecture
+        ### 🧠 Model Architecture
         - **Vision Encoder**: MobileNetV2 (lightweight CNN)
         - **Text Encoder**: Bi-LSTM with Attention
         - **Fusion**: Multimodal fusion of visual and textual features
         - **Accuracy**: 96.32% on test set
         
-        ###  Layer-wise Explainable AI
+        ### 🔍 Layer-wise Explainable AI
         This app uses **Layer-wise Grad-CAM** to show:
         1. **Early Layers**: Detect basic shapes, edges, and textures
         2. **Middle Layers**: Combine features into meaningful patterns
         3. **Late Layers**: High-level semantic features (faces, objects, emotions)
         
-        ###  How It Works
+        ### 🎨 How It Works
         1. Upload a child's drawing
         2. Optionally add the child's explanation
         3. The model analyzes both visual and textual inputs
         4. Get emotion prediction with confidence score
         5. View layer-wise explanations for the decision
         
-        ###  Use Cases
+        ### 📚 Use Cases
         - Early emotional screening in schools
         - Therapeutic settings
         - Parent-child communication aid
         - Educational research
         
-        ###  Model Performance
+        ### 🏆 Model Performance
         | **Metric** | **Value** |
         |:---|:---:|
         | Accuracy | 96.32% |
@@ -630,9 +674,11 @@ def main():
         | Inference Time | ~45 ms |
         """)
         
-        st.info(" **Tip**: For best results, upload a clear drawing and provide the child's explanation if available.")
+        st.info("💡 **Tip**: For best results, upload a clear drawing and provide the child's explanation if available.")
 
+# ============================================================================
 # RUN APP
+# ============================================================================
 
 if __name__ == "__main__":
     main()
