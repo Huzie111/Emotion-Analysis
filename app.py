@@ -12,7 +12,6 @@ from torchvision import transforms
 from captum.attr import LayerGradCam, LayerAttribution
 import os
 import io
-import base64
 import re
 import glob
 from datetime import datetime
@@ -142,12 +141,11 @@ def text_to_sequence(text, vocab, max_len=50):
 def find_model_file():
     """Search for model file in multiple locations."""
     
-    # First, check the compressed_models folder (where quantized models are)
     search_paths = [
-        # Quantized models (priority)
+        # Quantized model
+        "Emotion_Models/MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt",
         "Emotion_Models/compressed_models/MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt",
         "compressed_models/MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt",
-        "Emotion_Models/MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt",
         "MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt",
         
         # Original models (fallback)
@@ -158,24 +156,21 @@ def find_model_file():
         "*.pt",
     ]
     
-    # Check each path
     for path in search_paths:
         if os.path.exists(path):
             return path
         
-        # Check for wildcard
         if '*' in path:
             matches = glob.glob(path)
             if matches:
                 return matches[0]
     
-    # Search all subdirectories for .pt files
+    # Search all subdirectories
     for root, dirs, files in os.walk('.'):
         for file in files:
             if file.endswith('.pt') and 'efficientnet' in file.lower():
                 return os.path.join(root, file)
     
-    # If still not found, search for any .pt file
     for root, dirs, files in os.walk('.'):
         for file in files:
             if file.endswith('.pt'):
@@ -184,27 +179,24 @@ def find_model_file():
     return None
 
 # ============================================================================
-# LOAD MODEL
+# LOAD MODEL (FIXED)
 # ============================================================================
 
 @st.cache_resource
 def load_cached_model():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Find model file
     model_path = find_model_file()
     
     if model_path is None:
         st.error("""
         ❌ **Model file not found!**
         
-        Please upload your model file to the repository.
-        
-        Expected file: `Emotion_Models/compressed_models/MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt`
+        Expected: `Emotion_Models/MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt`
         """)
         
         # Show available files
-        st.subheader("📁 Available Files in Repository:")
+        st.subheader("📁 Available Files:")
         files = []
         for root, dirs, filenames in os.walk('.'):
             for f in filenames:
@@ -212,7 +204,6 @@ def load_cached_model():
                     files.append(os.path.join(root, f))
         
         if files:
-            st.write("Found these model files:")
             for f in files:
                 st.write(f"   - `{f}`")
         else:
@@ -221,29 +212,49 @@ def load_cached_model():
         return None, None, device
     
     try:
-        # Use the correct model name for EfficientNet-B0
         vocab = create_vocab()
         text_encoder = BiLSTMTextEncoder(len(vocab))
         model = MultimodalModel('efficientnet_b0', text_encoder)
         
-        # Load checkpoint with weights_only=False for compatibility
+        # Load checkpoint - FIXED: Try different loading methods
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        
+        # Check if checkpoint has 'model_state_dict' or is the state_dict itself
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        else:
+            # If checkpoint is the state_dict itself
+            model.load_state_dict(checkpoint, strict=False)
+        
         model.to(device)
         model.eval()
         
-        # Get file size
         file_size = os.path.getsize(model_path) / (1024 * 1024)
         
-        st.success(f"✅ Model loaded from `{model_path}` ({file_size:.2f} MB)")
+        st.success(f"✅ Model loaded from `{os.path.basename(model_path)}` ({file_size:.2f} MB)")
         st.info(f"📊 Model: EfficientNet-B0 + BiLSTM (Quantized Dynamic)")
         
         return model, vocab, device
         
     except Exception as e:
         st.error(f"❌ Error loading model: {e}")
-        st.code(f"Error details: {str(e)}")
-        return None, None, device
+        
+        # Try alternative loading method
+        try:
+            st.info("🔄 Trying alternative loading method...")
+            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+            
+            # Try loading state_dict directly
+            model.load_state_dict(checkpoint, strict=False)
+            model.to(device)
+            model.eval()
+            
+            st.success("✅ Model loaded with alternative method!")
+            return model, vocab, device
+            
+        except Exception as e2:
+            st.error(f"❌ Alternative loading also failed: {e2}")
+            return None, None, device
 
 # ============================================================================
 # GRAD-CAM FUNCTIONS
@@ -253,7 +264,6 @@ def get_target_layer(model):
     """Find the last convolutional layer for EfficientNet-B0."""
     vision = model.vision
     
-    # For EfficientNet-B0
     if hasattr(vision, 'features'):
         if hasattr(vision.features, '_modules'):
             keys = list(vision.features._modules.keys())
@@ -264,7 +274,6 @@ def get_target_layer(model):
                         return module
                 return vision.features._modules[keys[-1]]
     
-    # For EfficientNet with blocks
     if hasattr(vision, 'blocks'):
         if hasattr(vision.blocks, '_modules'):
             keys = list(vision.blocks._modules.keys())
@@ -274,7 +283,6 @@ def get_target_layer(model):
                     if isinstance(module, nn.Conv2d):
                         return module
     
-    # Fallback
     for name, module in vision.named_modules():
         if isinstance(module, nn.Conv2d):
             return module
@@ -403,8 +411,8 @@ def main():
     if model is None:
         st.stop()
     
-    # Create tabs
-    tab1, tab2, tab3 = st.tabs(["📤 Upload & Predict", "🔍 Layer-wise XAI", "📊 About"])
+    # Create tabs - REMOVED ABOUT TAB
+    tab1, tab2 = st.tabs(["📤 Upload & Predict", "🔍 Layer-wise XAI"])
     
     # ========================================================================
     # TAB 1: Upload & Predict
@@ -621,54 +629,6 @@ def main():
                     st.error(f"Error generating XAI: {e}")
                     import traceback
                     st.code(traceback.format_exc())
-    
-    # ========================================================================
-    # TAB 3: About
-    # ========================================================================
-    
-    with tab3:
-        st.header("📊 About This Application")
-        
-        st.markdown("""
-        ### 🎯 Purpose
-        This application analyzes children's drawings to detect emotional states (Happiness vs Sadness) 
-        using a multimodal deep learning model with layer-wise explainable AI.
-        
-        ### 🧠 Model Architecture
-        - **Vision Encoder**: EfficientNet-B0 (Quantized Dynamic)
-        - **Text Encoder**: Bi-LSTM with Attention
-        - **Fusion**: Multimodal fusion of visual and textual features
-        - **Accuracy**: 95.88% on test set
-        
-        ### 🔍 Layer-wise Explainable AI
-        This app uses **Layer-wise Grad-CAM** to show:
-        1. **Early Layers**: Detect basic shapes, edges, and textures
-        2. **Middle Layers**: Combine features into meaningful patterns
-        3. **Late Layers**: High-level semantic features (faces, objects, emotions)
-        
-        ### 🎨 How It Works
-        1. Upload a child's drawing
-        2. Optionally add the child's explanation
-        3. The model analyzes both visual and textual inputs
-        4. Get emotion prediction with confidence score
-        5. View layer-wise explanations for the decision
-        
-        ### 📚 Use Cases
-        - Early emotional screening in schools
-        - Therapeutic settings
-        - Parent-child communication aid
-        - Educational research
-        
-        ### 🏆 Model Performance
-        | **Metric** | **Value** |
-        |:---|:---:|
-        | Accuracy | 95.88% |
-        | Model Size | 19.00 MB |
-        | Parameters | 6.79M |
-        | Compression | Quantized Dynamic |
-        """)
-        
-        st.info("💡 **Tip**: For best results, upload a clear drawing and provide the child's explanation if available.")
 
 # ============================================================================
 # RUN APP
