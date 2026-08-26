@@ -1,5 +1,5 @@
 # ============================================================================
-# STREAMLIT APP: Emotion Detection with Layer-wise Grad-CAM
+# STREAMLIT APP: Emotion Detection with EfficientNet-B0 Quantized
 # ============================================================================
 
 import streamlit as st
@@ -14,6 +14,7 @@ import os
 import io
 import base64
 import re
+import glob
 from datetime import datetime
 
 # ============================================================================
@@ -54,13 +55,13 @@ class BiLSTMTextEncoder(nn.Module):
 def get_vision_encoder(name, pretrained=False):
     import torchvision.models as models
     backbones = {
-        'mobilenet_v2': (models.mobilenet_v2, 1280),
         'efficientnet_b0': (models.efficientnet_b0, 1280),
+        'mobilenet_v2': (models.mobilenet_v2, 1280),
         'shufflenet_v2_x1_0': (models.shufflenet_v2_x1_0, 1024),
     }
     
     if name not in backbones:
-        model_fn, dim = backbones['mobilenet_v2']
+        model_fn, dim = backbones['efficientnet_b0']
     else:
         model_fn, dim = backbones[name]
     
@@ -135,6 +136,54 @@ def text_to_sequence(text, vocab, max_len=50):
     return torch.tensor(seq, dtype=torch.long)
 
 # ============================================================================
+# FIND MODEL FILE
+# ============================================================================
+
+def find_model_file():
+    """Search for model file in multiple locations."""
+    
+    # First, check the compressed_models folder (where quantized models are)
+    search_paths = [
+        # Quantized models (priority)
+        "Emotion_Models/compressed_models/MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt",
+        "compressed_models/MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt",
+        "Emotion_Models/MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt",
+        "MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt",
+        
+        # Original models (fallback)
+        "Emotion_Models/MM_EfficientNet_B0_BiLSTM_final.pt",
+        "Emotion_Models/MM_MobileNetV2_BiLSTM_final.pt",
+        
+        # Wildcard search
+        "*.pt",
+    ]
+    
+    # Check each path
+    for path in search_paths:
+        if os.path.exists(path):
+            return path
+        
+        # Check for wildcard
+        if '*' in path:
+            matches = glob.glob(path)
+            if matches:
+                return matches[0]
+    
+    # Search all subdirectories for .pt files
+    for root, dirs, files in os.walk('.'):
+        for file in files:
+            if file.endswith('.pt') and 'efficientnet' in file.lower():
+                return os.path.join(root, file)
+    
+    # If still not found, search for any .pt file
+    for root, dirs, files in os.walk('.'):
+        for file in files:
+            if file.endswith('.pt'):
+                return os.path.join(root, file)
+    
+    return None
+
+# ============================================================================
 # LOAD MODEL
 # ============================================================================
 
@@ -142,47 +191,69 @@ def text_to_sequence(text, vocab, max_len=50):
 def load_cached_model():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Check for model file
-    model_paths = [
-        "Emotion_Models/MM_MobileNetV2_BiLSTM_final.pt",
-        "Emotion_Models/MM_MobileNetV2_BiLSTM_quantized_dynamic.pt",
-    ]
-    
-    model_path = None
-    for path in model_paths:
-        if os.path.exists(path):
-            model_path = path
-            break
+    # Find model file
+    model_path = find_model_file()
     
     if model_path is None:
-        st.error("❌ Model file not found!")
+        st.error("""
+        ❌ **Model file not found!**
+        
+        Please upload your model file to the repository.
+        
+        Expected file: `Emotion_Models/compressed_models/MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt`
+        """)
+        
+        # Show available files
+        st.subheader("📁 Available Files in Repository:")
+        files = []
+        for root, dirs, filenames in os.walk('.'):
+            for f in filenames:
+                if f.endswith('.pt') or f.endswith('.pth'):
+                    files.append(os.path.join(root, f))
+        
+        if files:
+            st.write("Found these model files:")
+            for f in files:
+                st.write(f"   - `{f}`")
+        else:
+            st.write("No `.pt` or `.pth` files found.")
+            
         return None, None, device
     
     try:
+        # Use the correct model name for EfficientNet-B0
         vocab = create_vocab()
         text_encoder = BiLSTMTextEncoder(len(vocab))
-        model = MultimodalModel('mobilenet_v2', text_encoder)
+        model = MultimodalModel('efficientnet_b0', text_encoder)
         
+        # Load checkpoint with weights_only=False for compatibility
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         model.to(device)
         model.eval()
         
-        st.success(f"✅ Model loaded from {os.path.basename(model_path)}")
+        # Get file size
+        file_size = os.path.getsize(model_path) / (1024 * 1024)
+        
+        st.success(f"✅ Model loaded from `{model_path}` ({file_size:.2f} MB)")
+        st.info(f"📊 Model: EfficientNet-B0 + BiLSTM (Quantized Dynamic)")
+        
         return model, vocab, device
         
     except Exception as e:
         st.error(f"❌ Error loading model: {e}")
+        st.code(f"Error details: {str(e)}")
         return None, None, device
 
 # ============================================================================
-# GRAD-CAM FUNCTIONS (NO OPENCV)
+# GRAD-CAM FUNCTIONS
 # ============================================================================
 
 def get_target_layer(model):
-    """Find the last convolutional layer."""
+    """Find the last convolutional layer for EfficientNet-B0."""
     vision = model.vision
     
+    # For EfficientNet-B0
     if hasattr(vision, 'features'):
         if hasattr(vision.features, '_modules'):
             keys = list(vision.features._modules.keys())
@@ -193,6 +264,7 @@ def get_target_layer(model):
                         return module
                 return vision.features._modules[keys[-1]]
     
+    # For EfficientNet with blocks
     if hasattr(vision, 'blocks'):
         if hasattr(vision.blocks, '_modules'):
             keys = list(vision.blocks._modules.keys())
@@ -202,9 +274,7 @@ def get_target_layer(model):
                     if isinstance(module, nn.Conv2d):
                         return module
     
-    if hasattr(vision, 'conv5'):
-        return vision.conv5
-    
+    # Fallback
     for name, module in vision.named_modules():
         if isinstance(module, nn.Conv2d):
             return module
@@ -295,60 +365,22 @@ def generate_layerwise_gradcam(model, image, target_class):
     
     return heatmaps, layer_names
 
-def overlay_heatmap_pil(image, heatmap, alpha=0.5):
-    """
-    Overlay heatmap on image using PIL (NO OPENCV).
-    """
-    # Convert image to numpy
-    if isinstance(image, torch.Tensor):
-        img = image.squeeze().cpu().permute(1, 2, 0).numpy()
-        img = np.clip(img, 0, 1)
-    else:
-        img = image
-    
-    # Resize heatmap to match image
-    from PIL import Image as PILImage
-    heatmap_resized = np.array(PILImage.fromarray(heatmap).resize((img.shape[1], img.shape[0])))
-    
-    # Create overlay using PIL
-    overlay = np.zeros_like(img)
-    
-    # Apply heatmap as color overlay
-    for i in range(3):
-        overlay[:, :, i] = img[:, :, i] * (1 - alpha) + heatmap_resized * alpha
-    
-    # Add red tint for high activation areas
-    overlay[:, :, 0] = np.maximum(overlay[:, :, 0], heatmap_resized * 0.8)
-    
-    return np.clip(overlay, 0, 1)
-
 def overlay_heatmap_jet(image, heatmap, alpha=0.5):
-    """
-    Overlay heatmap with jet colormap using matplotlib (NO OPENCV).
-    """
-    # Convert image to numpy
+    """Overlay heatmap with jet colormap using matplotlib."""
     if isinstance(image, torch.Tensor):
         img = image.squeeze().cpu().permute(1, 2, 0).numpy()
         img = np.clip(img, 0, 1)
     else:
         img = image
     
-    # Resize heatmap
     from PIL import Image as PILImage
     heatmap_resized = np.array(PILImage.fromarray(heatmap).resize((img.shape[1], img.shape[0])))
     
-    # Create jet colormap overlay
     cmap = plt.cm.jet(heatmap_resized)
     heatmap_color = cmap[:, :, :3]
     
-    # Overlay
     overlay = img * (1 - alpha) + heatmap_color * alpha
-    
     return np.clip(overlay, 0, 1)
-
-# ============================================================================
-# DISPLAY FUNCTIONS
-# ============================================================================
 
 def normalize_image(tensor):
     """Normalize image tensor for display."""
@@ -407,26 +439,22 @@ def main():
                 if predict_button:
                     with st.spinner("Analyzing..."):
                         try:
-                            # Preprocess
                             transform = transforms.Compose([
                                 transforms.Resize((224, 224)),
                                 transforms.ToTensor(),
                             ])
                             img_tensor = transform(image).unsqueeze(0).to(device)
                             
-                            # Create text tensor
                             if child_text:
                                 text_tensor = text_to_sequence(child_text, vocab).unsqueeze(0).to(device)
                             else:
                                 text_tensor = torch.zeros(1, 50, dtype=torch.long).to(device)
                             
-                            # Predict
                             with torch.no_grad():
                                 output = model(img_tensor, text_tensor)
                                 probs = torch.softmax(output, dim=1)
                                 pred = torch.argmax(probs, dim=1).item()
                             
-                            # Results
                             emotion = "Happy 😊" if pred == 0 else "Sad 😢"
                             confidence = probs[0][pred].item()
                             
@@ -441,7 +469,6 @@ def main():
                             </div>
                             """, unsafe_allow_html=True)
                             
-                            # Store for XAI tab
                             st.session_state['current_image'] = img_tensor
                             st.session_state['current_pred'] = pred
                             st.session_state['current_probs'] = probs
@@ -465,7 +492,6 @@ def main():
             pred_class = st.session_state['current_pred']
             pil_image = st.session_state['current_pil']
             
-            # Layer selection
             st.subheader("Layer Selection")
             col1, col2 = st.columns([1, 1])
             
@@ -484,24 +510,17 @@ def main():
                 target_label = "Happy" if pred_class == 0 else "Sad"
                 st.write(f"**Target Class:** {target_label}")
             
-            # Generate Grad-CAM
             with st.spinner("Generating explanation..."):
                 try:
-                    # Get layer index
                     layer_idx = layer_options.index(selected_layer)
                     
-                    # Generate heatmap
                     heatmap = generate_gradcam_heatmap(
                         model, image_tensor, pred_class, layer_idx
                     )
                     
-                    # Normalize image
                     img_display = normalize_image(image_tensor)
-                    
-                    # Create overlay using matplotlib (NO OPENCV)
                     overlay = overlay_heatmap_jet(img_display, heatmap, alpha)
                     
-                    # Display
                     col1, col2, col3 = st.columns(3)
                     
                     with col1:
@@ -513,42 +532,28 @@ def main():
                     with col3:
                         st.image(overlay, caption="Overlay", use_container_width=True)
                     
-                    # ============================================================
-                    # Layer-wise Grid (All Layers)
-                    # ============================================================
-                    
                     st.subheader("Layer-wise Grad-CAM Grid")
                     st.markdown("All layers side-by-side for comparison")
                     
-                    # Generate all layers
                     with st.spinner("Generating all layers..."):
                         heatmaps, layer_names = generate_layerwise_gradcam(
                             model, image_tensor, pred_class
                         )
                         
-                        # Display grid
                         cols = st.columns(len(heatmaps))
-                        
                         for i, (col, hm, name) in enumerate(zip(cols, heatmaps, layer_names)):
                             with col:
                                 st.image(hm, caption=f"{name[:12]}", use_container_width=True)
                         
-                        # Display overlay grid
                         st.markdown("### Overlay Grid")
                         cols_overlay = st.columns(len(heatmaps))
-                        
                         for i, (col, hm, name) in enumerate(zip(cols_overlay, heatmaps, layer_names)):
                             with col:
                                 overlay_hm = overlay_heatmap_jet(img_display, hm, alpha)
                                 st.image(overlay_hm, caption=f"{name[:12]}", use_container_width=True)
                     
-                    # ============================================================
-                    # Interpretation
-                    # ============================================================
-                    
                     st.subheader("📖 Interpretation")
                     
-                    # Determine which layer shows the most focused regions
                     focus_scores = []
                     for hm in heatmaps:
                         focus = (hm > 0.5).mean()
@@ -564,7 +569,6 @@ def main():
                         - Areas around the eyes and mouth (smile indicators)
                         - Bright/positive color regions
                         - Open body language features
-                        - The early layers capture basic shapes, while later layers capture semantic features
                         """)
                     else:
                         st.warning(f"""
@@ -573,30 +577,21 @@ def main():
                         - Areas around the eyes (drooping indicators)
                         - Darker/shadow regions
                         - Closed/withdrawn body language features
-                        - The early layers capture basic shapes, while later layers capture semantic features
                         """)
-                    
-                    # ============================================================
-                    # Download Button
-                    # ============================================================
                     
                     st.subheader("📥 Export Explanation")
                     
-                    # Create a combined figure
                     fig, axes = plt.subplots(2, len(heatmaps) + 1, figsize=(20, 8))
                     
-                    # Original
                     axes[0, 0].imshow(img_display)
                     axes[0, 0].set_title('Original')
                     axes[0, 0].axis('off')
                     
-                    # Heatmaps
                     for i, (hm, name) in enumerate(zip(heatmaps, layer_names)):
                         axes[0, i+1].imshow(hm, cmap='jet')
                         axes[0, i+1].set_title(name[:12])
                         axes[0, i+1].axis('off')
                     
-                    # Overlays
                     axes[1, 0].imshow(img_display)
                     axes[1, 0].set_title('Original')
                     axes[1, 0].axis('off')
@@ -610,7 +605,6 @@ def main():
                     plt.suptitle(f'Layer-wise Grad-CAM - Target: {target_label}', fontsize=16)
                     plt.tight_layout()
                     
-                    # Save to buffer
                     buf = io.BytesIO()
                     plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
                     buf.seek(0)
@@ -641,10 +635,10 @@ def main():
         using a multimodal deep learning model with layer-wise explainable AI.
         
         ### 🧠 Model Architecture
-        - **Vision Encoder**: MobileNetV2 (lightweight CNN)
+        - **Vision Encoder**: EfficientNet-B0 (Quantized Dynamic)
         - **Text Encoder**: Bi-LSTM with Attention
         - **Fusion**: Multimodal fusion of visual and textual features
-        - **Accuracy**: 96.32% on test set
+        - **Accuracy**: 95.88% on test set
         
         ### 🔍 Layer-wise Explainable AI
         This app uses **Layer-wise Grad-CAM** to show:
@@ -668,10 +662,10 @@ def main():
         ### 🏆 Model Performance
         | **Metric** | **Value** |
         |:---|:---:|
-        | Accuracy | 96.32% |
-        | Model Size | 19.24 MB |
-        | Parameters | 5.01M |
-        | Inference Time | ~45 ms |
+        | Accuracy | 95.88% |
+        | Model Size | 19.00 MB |
+        | Parameters | 6.79M |
+        | Compression | Quantized Dynamic |
         """)
         
         st.info("💡 **Tip**: For best results, upload a clear drawing and provide the child's explanation if available.")
