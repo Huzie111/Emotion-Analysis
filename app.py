@@ -1,5 +1,5 @@
 # ============================================================================
-# STREAMLIT APP: Emotion Detection with EfficientNet-B0 Quantized
+# STREAMLIT APP: Emotion Detection with EfficientNet-B0 (Google Drive)
 # ============================================================================
 
 import streamlit as st
@@ -13,9 +13,10 @@ from captum.attr import LayerGradCam, LayerAttribution
 import os
 import io
 import re
-import glob
 import json
 from datetime import datetime
+import gdown
+import tempfile
 
 # ============================================================================
 # PAGE CONFIGURATION
@@ -32,11 +33,20 @@ st.markdown("Upload a drawing to detect if it expresses **Happiness** or **Sadne
 st.markdown("---")
 
 # ============================================================================
+# GOOGLE DRIVE FILE ID (UPDATE THIS!)
+# ============================================================================
+
+# Replace this with your actual Google Drive File ID
+# Example: If your URL is https://drive.google.com/file/d/abc123xyz/view
+# Then FILE_ID = "abc123xyz"
+FILE_ID = "YOUR_FILE_ID_HERE"  # ← UPDATE THIS!
+
+# ============================================================================
 # MODEL ARCHITECTURE
 # ============================================================================
 
 class BiLSTMTextEncoder(nn.Module):
-    def __init__(self, vocab_size, embed_dim=300, hidden=128, dropout=0.3):
+    def __init__(self, vocab_size=3423, embed_dim=300, hidden=128, dropout=0.3):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
         self.lstm = nn.LSTM(embed_dim, hidden, 2, bidirectional=True, 
@@ -109,14 +119,13 @@ class MultimodalModel(nn.Module):
         return self.classifier(fused)
 
 # ============================================================================
-# VOCABULARY - DYNAMIC SIZE
+# VOCABULARY
 # ============================================================================
 
 def create_vocab(vocab_size=3423):
     """Create a vocabulary with the specified size."""
     vocab = {'<PAD>': 0, '<UNK>': 1}
     
-    # Common words from the dataset
     common_words = [
         'happy', 'sad', 'draw', 'feel', 'like', 'love', 'cry', 'smile',
         'angry', 'scared', 'excited', 'tired', 'bored', 'lonely', 'fun',
@@ -151,119 +160,42 @@ def text_to_sequence(text, vocab, max_len=50):
     return torch.tensor(seq, dtype=torch.long)
 
 # ============================================================================
-# FIND MODEL FILE
-# ============================================================================
-
-def find_model_file():
-    """Search for model file in multiple locations."""
-    
-    search_paths = [
-        "Emotion_Models/MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt",
-        "Emotion_Models/compressed_models/MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt",
-        "compressed_models/MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt",
-        "MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt",
-        "Emotion_Models/MM_EfficientNet_B0_BiLSTM_final.pt",
-        "*.pt",
-    ]
-    
-    for path in search_paths:
-        if os.path.exists(path):
-            return path
-        
-        if '*' in path:
-            matches = glob.glob(path)
-            if matches:
-                return matches[0]
-    
-    # Search all subdirectories
-    for root, dirs, files in os.walk('.'):
-        for file in files:
-            if file.endswith('.pt'):
-                return os.path.join(root, file)
-    
-    return None
-
-# ============================================================================
-# LOAD MODEL (FIXED VOCABULARY)
+# LOAD MODEL FROM GOOGLE DRIVE
 # ============================================================================
 
 @st.cache_resource
-def load_cached_model():
+def download_and_load_model():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    model_path = find_model_file()
-    
-    if model_path is None:
+    # Check if FILE_ID is set
+    if FILE_ID == "YOUR_FILE_ID_HERE":
         st.error("""
-        ❌ **Model file not found!**
+        ❌ **Google Drive File ID not set!**
         
-        Expected: `Emotion_Models/MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt`
+        Please update `FILE_ID` in the app code with your actual Google Drive file ID.
+        
+        1. Upload your model to Google Drive
+        2. Get the shareable link
+        3. Copy the File ID from the link
+        4. Update the FILE_ID variable
         """)
-        
-        # Show available files
-        st.subheader("📁 Available Files:")
-        files = []
-        for root, dirs, filenames in os.walk('.'):
-            for f in filenames:
-                if f.endswith('.pt') or f.endswith('.pth'):
-                    files.append(os.path.join(root, f))
-        
-        if files:
-            for f in files:
-                st.write(f"   - `{f}`")
-        else:
-            st.write("No `.pt` or `.pth` files found.")
-            
         return None, None, device
     
     try:
-        # Load checkpoint to get vocab size
-        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-        
-        # Get vocabulary size from embedding weight
-        state_dict = checkpoint.get('model_state_dict', checkpoint)
-        embedding_weight = state_dict.get('text_encoder.embedding.weight')
-        
-        if embedding_weight is not None:
-            vocab_size = embedding_weight.shape[0]
-        else:
-            vocab_size = 3423  # Default
-        
-        st.info(f"📊 Using vocabulary size: {vocab_size}")
-        
-        # Create vocabulary with correct size
-        vocab = create_vocab(vocab_size)
-        
-        # Create model with correct vocab size
-        text_encoder = BiLSTMTextEncoder(vocab_size)
-        model = MultimodalModel('efficientnet_b0', text_encoder)
-        
-        # Load weights
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-        else:
-            model.load_state_dict(checkpoint, strict=False)
-        
-        model.to(device)
-        model.eval()
-        
-        file_size = os.path.getsize(model_path) / (1024 * 1024)
-        
-        st.success(f"✅ Model loaded from `{os.path.basename(model_path)}` ({file_size:.2f} MB)")
-        st.info(f"📊 Model: EfficientNet-B0 + BiLSTM (Quantized Dynamic)")
-        st.info(f"📊 Vocabulary size: {vocab_size}")
-        
-        return model, vocab, device
-        
-    except Exception as e:
-        st.error(f"❌ Error loading model: {e}")
-        
-        # Try alternative loading method
-        try:
-            st.info("🔄 Trying alternative loading method...")
+        # Create a temporary directory
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = os.path.join(tmpdir, "model.pt")
+            
+            # Download from Google Drive
+            url = f"https://drive.google.com/uc?id={FILE_ID}"
+            
+            with st.spinner("📥 Downloading model from Google Drive..."):
+                gdown.download(url, model_path, quiet=False)
+            
+            # Load the model
             checkpoint = torch.load(model_path, map_location=device, weights_only=False)
             
-            # Get vocab size from checkpoint
+            # Get vocabulary size from embedding
             state_dict = checkpoint.get('model_state_dict', checkpoint)
             embedding_weight = state_dict.get('text_encoder.embedding.weight')
             
@@ -272,17 +204,68 @@ def load_cached_model():
             else:
                 vocab_size = 3423
             
+            # Create vocabulary
             vocab = create_vocab(vocab_size)
+            
+            # Create model
             text_encoder = BiLSTMTextEncoder(vocab_size)
             model = MultimodalModel('efficientnet_b0', text_encoder)
             
-            model.load_state_dict(checkpoint, strict=False)
+            # Load weights
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            else:
+                model.load_state_dict(checkpoint, strict=False)
+            
             model.to(device)
             model.eval()
             
-            st.success("✅ Model loaded with alternative method!")
+            st.success(f"✅ Model loaded successfully from Google Drive!")
+            st.info(f"📊 Vocabulary size: {vocab_size}")
+            
             return model, vocab, device
             
+    except Exception as e:
+        st.error(f"❌ Error loading model: {e}")
+        
+        # Alternative: Try with different gdown method
+        try:
+            st.info("🔄 Trying alternative download method...")
+            
+            # Try using direct download
+            import requests
+            url = f"https://drive.google.com/uc?export=download&id={FILE_ID}"
+            
+            response = requests.get(url, stream=True)
+            
+            with tempfile.TemporaryDirectory() as tmpdir:
+                model_path = os.path.join(tmpdir, "model.pt")
+                
+                with open(model_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                
+                checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+                
+                state_dict = checkpoint.get('model_state_dict', checkpoint)
+                embedding_weight = state_dict.get('text_encoder.embedding.weight')
+                vocab_size = embedding_weight.shape[0] if embedding_weight is not None else 3423
+                
+                vocab = create_vocab(vocab_size)
+                text_encoder = BiLSTMTextEncoder(vocab_size)
+                model = MultimodalModel('efficientnet_b0', text_encoder)
+                
+                if 'model_state_dict' in checkpoint:
+                    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                else:
+                    model.load_state_dict(checkpoint, strict=False)
+                
+                model.to(device)
+                model.eval()
+                
+                st.success("✅ Model loaded with alternative method!")
+                return model, vocab, device
+                
         except Exception as e2:
             st.error(f"❌ Alternative loading also failed: {e2}")
             return None, None, device
@@ -436,8 +419,8 @@ def normalize_image(tensor):
 # ============================================================================
 
 def main():
-    # Load model
-    model, vocab, device = load_cached_model()
+    # Download and load model
+    model, vocab, device = download_and_load_model()
     
     if model is None:
         st.stop()
