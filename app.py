@@ -14,6 +14,7 @@ import os
 import io
 import re
 import glob
+import json
 from datetime import datetime
 
 # ============================================================================
@@ -35,7 +36,7 @@ st.markdown("---")
 # ============================================================================
 
 class BiLSTMTextEncoder(nn.Module):
-    def __init__(self, vocab_size=3423, embed_dim=300, hidden=128, dropout=0.3):
+    def __init__(self, vocab_size, embed_dim=300, hidden=128, dropout=0.3):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
         self.lstm = nn.LSTM(embed_dim, hidden, 2, bidirectional=True, 
@@ -108,21 +109,36 @@ class MultimodalModel(nn.Module):
         return self.classifier(fused)
 
 # ============================================================================
-# VOCABULARY
+# VOCABULARY - DYNAMIC SIZE
 # ============================================================================
 
-def create_vocab():
+def create_vocab(vocab_size=3423):
+    """Create a vocabulary with the specified size."""
     vocab = {'<PAD>': 0, '<UNK>': 1}
+    
+    # Common words from the dataset
     common_words = [
         'happy', 'sad', 'draw', 'feel', 'like', 'love', 'cry', 'smile',
         'angry', 'scared', 'excited', 'tired', 'bored', 'lonely', 'fun',
         'play', 'friend', 'family', 'school', 'home', 'dog', 'cat', 'sun',
         'rain', 'because', 'very', 'really', 'want', 'think', 'know', 'see',
         'look', 'good', 'bad', 'nice', 'great', 'wonderful', 'terrible',
-        'awful', 'beautiful', 'ugly', 'big', 'small', 'little', 'much'
+        'awful', 'beautiful', 'ugly', 'big', 'small', 'little', 'much',
+        'many', 'more', 'most', 'some', 'any', 'all', 'every', 'people',
+        'child', 'mother', 'father', 'brother', 'sister', 'teacher',
+        'school', 'home', 'funny', 'silly', 'scary', 'brave', 'kind',
+        'mean', 'loved', 'hated', 'confused', 'surprised', 'worried',
+        'proud', 'embarrassed', 'jealous', 'guilty', 'shy', 'confident'
     ]
+    
     for i, word in enumerate(common_words, 2):
         vocab[word] = i
+    
+    # Fill remaining vocabulary with placeholder tokens
+    current_size = len(vocab)
+    for i in range(current_size, vocab_size):
+        vocab[f'<TOKEN_{i}>'] = i
+    
     return vocab
 
 def text_to_sequence(text, vocab, max_len=50):
@@ -142,17 +158,11 @@ def find_model_file():
     """Search for model file in multiple locations."""
     
     search_paths = [
-        # Quantized model
         "Emotion_Models/MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt",
         "Emotion_Models/compressed_models/MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt",
         "compressed_models/MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt",
         "MM_EfficientNet_B0_BiLSTM_quantized_dynamic.pt",
-        
-        # Original models (fallback)
         "Emotion_Models/MM_EfficientNet_B0_BiLSTM_final.pt",
-        "Emotion_Models/MM_MobileNetV2_BiLSTM_final.pt",
-        
-        # Wildcard search
         "*.pt",
     ]
     
@@ -168,18 +178,13 @@ def find_model_file():
     # Search all subdirectories
     for root, dirs, files in os.walk('.'):
         for file in files:
-            if file.endswith('.pt') and 'efficientnet' in file.lower():
-                return os.path.join(root, file)
-    
-    for root, dirs, files in os.walk('.'):
-        for file in files:
             if file.endswith('.pt'):
                 return os.path.join(root, file)
     
     return None
 
 # ============================================================================
-# LOAD MODEL (FIXED)
+# LOAD MODEL (FIXED VOCABULARY)
 # ============================================================================
 
 @st.cache_resource
@@ -212,18 +217,31 @@ def load_cached_model():
         return None, None, device
     
     try:
-        vocab = create_vocab()
-        text_encoder = BiLSTMTextEncoder(len(vocab))
-        model = MultimodalModel('efficientnet_b0', text_encoder)
-        
-        # Load checkpoint - FIXED: Try different loading methods
+        # Load checkpoint to get vocab size
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         
-        # Check if checkpoint has 'model_state_dict' or is the state_dict itself
+        # Get vocabulary size from embedding weight
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        embedding_weight = state_dict.get('text_encoder.embedding.weight')
+        
+        if embedding_weight is not None:
+            vocab_size = embedding_weight.shape[0]
+        else:
+            vocab_size = 3423  # Default
+        
+        st.info(f"📊 Using vocabulary size: {vocab_size}")
+        
+        # Create vocabulary with correct size
+        vocab = create_vocab(vocab_size)
+        
+        # Create model with correct vocab size
+        text_encoder = BiLSTMTextEncoder(vocab_size)
+        model = MultimodalModel('efficientnet_b0', text_encoder)
+        
+        # Load weights
         if 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         else:
-            # If checkpoint is the state_dict itself
             model.load_state_dict(checkpoint, strict=False)
         
         model.to(device)
@@ -233,6 +251,7 @@ def load_cached_model():
         
         st.success(f"✅ Model loaded from `{os.path.basename(model_path)}` ({file_size:.2f} MB)")
         st.info(f"📊 Model: EfficientNet-B0 + BiLSTM (Quantized Dynamic)")
+        st.info(f"📊 Vocabulary size: {vocab_size}")
         
         return model, vocab, device
         
@@ -244,7 +263,19 @@ def load_cached_model():
             st.info("🔄 Trying alternative loading method...")
             checkpoint = torch.load(model_path, map_location=device, weights_only=False)
             
-            # Try loading state_dict directly
+            # Get vocab size from checkpoint
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
+            embedding_weight = state_dict.get('text_encoder.embedding.weight')
+            
+            if embedding_weight is not None:
+                vocab_size = embedding_weight.shape[0]
+            else:
+                vocab_size = 3423
+            
+            vocab = create_vocab(vocab_size)
+            text_encoder = BiLSTMTextEncoder(vocab_size)
+            model = MultimodalModel('efficientnet_b0', text_encoder)
+            
             model.load_state_dict(checkpoint, strict=False)
             model.to(device)
             model.eval()
@@ -411,7 +442,7 @@ def main():
     if model is None:
         st.stop()
     
-    # Create tabs - REMOVED ABOUT TAB
+    # Create tabs
     tab1, tab2 = st.tabs(["📤 Upload & Predict", "🔍 Layer-wise XAI"])
     
     # ========================================================================
