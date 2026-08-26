@@ -17,6 +17,7 @@ import json
 import requests
 from datetime import datetime
 import tempfile
+import time
 
 # ============================================================================
 # PAGE CONFIGURATION
@@ -157,46 +158,64 @@ def text_to_sequence(text, vocab, max_len=50):
     return torch.tensor(seq, dtype=torch.long)
 
 # ============================================================================
-# DOWNLOAD FROM GOOGLE DRIVE (FIXED)
+# GOOGLE DRIVE DOWNLOAD WITH COOKIE HANDLING (FIXED)
 # ============================================================================
 
 def download_from_google_drive(file_id, destination):
-    """Download a file from Google Drive with confirmation token handling."""
+    """Download a file from Google Drive with proper cookie handling."""
     
-    URL = "https://drive.google.com/uc?export=download"
-    
+    # Create a session with cookies
     session = requests.Session()
     
-    response = session.get(URL, params={'id': file_id}, stream=True)
+    # Step 1: Get the confirmation page
+    url = "https://drive.google.com/uc"
+    params = {'id': file_id, 'export': 'download'}
     
-    # Check if we need to confirm the download
-    if 'confirm' in response.text or 'download_warning' in response.text:
-        # Extract confirmation token
-        import re
-        confirm_match = re.search(r'confirm=([^&]+)', response.text)
+    response = session.get(url, params=params, stream=True)
+    
+    # Check if we need to confirm
+    content = response.text
+    
+    # Check for virus scan warning
+    if 'Virus scan warning' in content or 'quota exceeded' in content.lower():
+        # Try to extract the confirmation token
+        confirm_match = re.search(r'confirm=([^&"\']+)', content)
         if confirm_match:
             confirm_token = confirm_match.group(1)
+            params['confirm'] = confirm_token
+            response = session.get(url, params=params, stream=True)
         else:
-            # Try to find it in the cookies
-            confirm_token = response.cookies.get('download_warning', '')
-        
-        if confirm_token:
-            # Request with confirmation token
-            response = session.get(
-                URL, 
-                params={'id': file_id, 'confirm': confirm_token},
-                stream=True
-            )
-        else:
-            # Try with direct download
-            response = session.get(
-                f"https://drive.google.com/uc?export=download&id={file_id}",
-                stream=True
-            )
+            # Try the direct download URL
+            download_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+            response = session.get(download_url, stream=True)
     
-    # Check if response is successful
+    # Check if we got HTML instead of the file
+    content_type = response.headers.get('Content-Type', '')
+    if 'text/html' in content_type:
+        # Check if there's a download warning
+        if 'confirm' in response.text:
+            # Extract confirmation token
+            confirm_match = re.search(r'confirm=([^&"\']+)', response.text)
+            if confirm_match:
+                confirm_token = confirm_match.group(1)
+                download_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm={confirm_token}"
+                response = session.get(download_url, stream=True)
+    
+    # Check final response
     if response.status_code != 200:
         raise Exception(f"Failed to download: Status {response.status_code}")
+    
+    # Verify we're not getting HTML
+    content_type = response.headers.get('Content-Type', '')
+    if 'text/html' in content_type:
+        # Try one more time with direct download
+        download_url = f"https://drive.google.com/u/0/uc?id={file_id}&export=download&confirm=t"
+        response = session.get(download_url, stream=True)
+        
+        # Check again
+        content_type = response.headers.get('Content-Type', '')
+        if 'text/html' in content_type:
+            raise Exception("Still getting HTML. The file may be too large or require manual download.")
     
     # Save the file
     total_size = int(response.headers.get('content-length', 0))
@@ -207,14 +226,57 @@ def download_from_google_drive(file_id, destination):
             if chunk:
                 f.write(chunk)
                 downloaded += len(chunk)
-                
-                # Show progress if total size is known
                 if total_size > 0:
                     progress = (downloaded / total_size) * 100
                     print(f"\rDownloading: {progress:.1f}%", end='')
     
     print("\nDownload complete!")
+    
+    # Verify the file is a valid PyTorch file
+    try:
+        with open(destination, 'rb') as f:
+            header = f.read(10)
+            if b'PK' in header or b'<html' in header.lower():
+                raise Exception("Downloaded file appears to be HTML or ZIP, not a PyTorch model")
+    except:
+        pass
+    
     return destination
+
+# ============================================================================
+# ALTERNATIVE: Download using gdown with proper settings
+# ============================================================================
+
+def download_with_gdown(file_id, destination):
+    """Download using gdown with proper settings."""
+    import gdown
+    
+    # Try different URL formats
+    urls = [
+        f"https://drive.google.com/uc?id={file_id}",
+        f"https://drive.google.com/uc?export=download&id={file_id}",
+        f"https://drive.google.com/file/d/{file_id}/view"
+    ]
+    
+    for url in urls:
+        try:
+            print(f"Trying: {url}")
+            gdown.download(url, destination, quiet=False, fuzzy=True)
+            
+            # Check if file was downloaded
+            if os.path.exists(destination) and os.path.getsize(destination) > 1024:
+                # Verify it's not HTML
+                with open(destination, 'rb') as f:
+                    header = f.read(100)
+                    if b'<html' not in header.lower() and b'<!DOCTYPE' not in header:
+                        print("Download successful!")
+                        return destination
+            print("Download failed for this URL, trying next...")
+        except Exception as e:
+            print(f"Error with {url}: {e}")
+            continue
+    
+    raise Exception("All download methods failed")
 
 # ============================================================================
 # LOAD MODEL FROM GOOGLE DRIVE
@@ -224,37 +286,60 @@ def download_from_google_drive(file_id, destination):
 def download_and_load_model():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Check if FILE_ID is set
     if not FILE_ID or FILE_ID == "YOUR_FILE_ID_HERE":
-        st.error("""
-        ❌ **Google Drive File ID not set!**
-        
-        Please update `FILE_ID` in the app code.
-        """)
+        st.error("❌ Google Drive File ID not set!")
         return None, None, device
     
     try:
-        # Create a temporary directory
         with tempfile.TemporaryDirectory() as tmpdir:
             model_path = os.path.join(tmpdir, "model.pt")
             
-            # Download from Google Drive
-            with st.spinner("📥 Downloading model from Google Drive..."):
-                try:
+            # Try multiple download methods
+            download_success = False
+            
+            # Method 1: Custom download with cookie handling
+            try:
+                with st.spinner("📥 Downloading model from Google Drive (Method 1)..."):
                     download_from_google_drive(FILE_ID, model_path)
-                    st.info("✅ Model downloaded successfully!")
+                    download_success = True
+                    st.info("✅ Method 1 successful!")
+            except Exception as e:
+                st.warning(f"Method 1 failed: {e}")
+            
+            # Method 2: gdown with fuzzy matching
+            if not download_success:
+                try:
+                    with st.spinner("📥 Downloading model from Google Drive (Method 2)..."):
+                        download_with_gdown(FILE_ID, model_path)
+                        download_success = True
+                        st.info("✅ Method 2 successful!")
                 except Exception as e:
-                    st.warning(f"⚠️ Download issue: {e}")
-                    
-                    # Try alternative method
-                    st.info("🔄 Trying alternative download method...")
-                    import gdown
-                    url = f"https://drive.google.com/uc?id={FILE_ID}"
-                    gdown.download(url, model_path, quiet=False, fuzzy=True)
+                    st.warning(f"Method 2 failed: {e}")
+            
+            # Method 3: Manual link (provide instructions)
+            if not download_success:
+                st.error("""
+                ❌ **Automatic download failed.**
+                
+                Please manually download the model file from Google Drive and upload it to your repository.
+                
+                **Steps:**
+                1. Go to: https://drive.google.com/file/d/""" + FILE_ID + """/view
+                2. Click "Download"
+                3. Upload the file to `Emotion_Models/MM_EfficientNet_B0_BiLSTM_final.pt`
+                4. Restart the app
+                """)
+                return None, None, device
             
             # Check if file exists
             if not os.path.exists(model_path):
                 st.error("❌ Model file not found after download!")
+                return None, None, device
+            
+            # Check file size
+            file_size = os.path.getsize(model_path) / (1024 * 1024)
+            if file_size < 1:
+                st.error(f"❌ File too small ({file_size:.2f} MB). Likely an HTML error page.")
                 return None, None, device
             
             # Load the model
@@ -287,11 +372,22 @@ def download_and_load_model():
             
             st.success(f"✅ Model loaded successfully from Google Drive!")
             st.info(f"📊 Vocabulary size: {vocab_size}")
+            st.info(f"📦 File size: {file_size:.2f} MB")
             
             return model, vocab, device
             
     except Exception as e:
         st.error(f"❌ Error loading model: {e}")
+        
+        # Show helpful message
+        st.info("""
+        💡 **Troubleshooting:**
+        
+        1. Make sure the file is shared with "Anyone with the link"
+        2. Check that the FILE_ID is correct
+        3. Try manually downloading and uploading to the repository
+        """)
+        
         return None, None, device
 
 # ============================================================================
