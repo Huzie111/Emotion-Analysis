@@ -14,8 +14,8 @@ import os
 import io
 import re
 import json
+import requests
 from datetime import datetime
-import gdown
 import tempfile
 
 # ============================================================================
@@ -36,10 +36,7 @@ st.markdown("---")
 # GOOGLE DRIVE FILE ID (UPDATE THIS!)
 # ============================================================================
 
-# Replace this with your actual Google Drive File ID
-# Example: If your URL is https://drive.google.com/file/d/abc123xyz/view
-# Then FILE_ID = "abc123xyz"
-FILE_ID = "1f8Ruzcy_7RfEzcEBDCnSQWAeOqs59hjZ"  # ← UPDATE THIS!
+FILE_ID = "1f8Ruzcy_7RfEzcEBDCnSQWAeOqs59hjZ"  # Your file ID
 
 # ============================================================================
 # MODEL ARCHITECTURE
@@ -160,6 +157,66 @@ def text_to_sequence(text, vocab, max_len=50):
     return torch.tensor(seq, dtype=torch.long)
 
 # ============================================================================
+# DOWNLOAD FROM GOOGLE DRIVE (FIXED)
+# ============================================================================
+
+def download_from_google_drive(file_id, destination):
+    """Download a file from Google Drive with confirmation token handling."""
+    
+    URL = "https://drive.google.com/uc?export=download"
+    
+    session = requests.Session()
+    
+    response = session.get(URL, params={'id': file_id}, stream=True)
+    
+    # Check if we need to confirm the download
+    if 'confirm' in response.text or 'download_warning' in response.text:
+        # Extract confirmation token
+        import re
+        confirm_match = re.search(r'confirm=([^&]+)', response.text)
+        if confirm_match:
+            confirm_token = confirm_match.group(1)
+        else:
+            # Try to find it in the cookies
+            confirm_token = response.cookies.get('download_warning', '')
+        
+        if confirm_token:
+            # Request with confirmation token
+            response = session.get(
+                URL, 
+                params={'id': file_id, 'confirm': confirm_token},
+                stream=True
+            )
+        else:
+            # Try with direct download
+            response = session.get(
+                f"https://drive.google.com/uc?export=download&id={file_id}",
+                stream=True
+            )
+    
+    # Check if response is successful
+    if response.status_code != 200:
+        raise Exception(f"Failed to download: Status {response.status_code}")
+    
+    # Save the file
+    total_size = int(response.headers.get('content-length', 0))
+    downloaded = 0
+    
+    with open(destination, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
+                downloaded += len(chunk)
+                
+                # Show progress if total size is known
+                if total_size > 0:
+                    progress = (downloaded / total_size) * 100
+                    print(f"\rDownloading: {progress:.1f}%", end='')
+    
+    print("\nDownload complete!")
+    return destination
+
+# ============================================================================
 # LOAD MODEL FROM GOOGLE DRIVE
 # ============================================================================
 
@@ -168,16 +225,11 @@ def download_and_load_model():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Check if FILE_ID is set
-    if FILE_ID == "YOUR_FILE_ID_HERE":
+    if not FILE_ID or FILE_ID == "YOUR_FILE_ID_HERE":
         st.error("""
         ❌ **Google Drive File ID not set!**
         
-        Please update `FILE_ID` in the app code with your actual Google Drive file ID.
-        
-        1. Upload your model to Google Drive
-        2. Get the shareable link
-        3. Copy the File ID from the link
-        4. Update the FILE_ID variable
+        Please update `FILE_ID` in the app code.
         """)
         return None, None, device
     
@@ -187,10 +239,23 @@ def download_and_load_model():
             model_path = os.path.join(tmpdir, "model.pt")
             
             # Download from Google Drive
-            url = f"https://drive.google.com/uc?id={FILE_ID}"
-            
             with st.spinner("📥 Downloading model from Google Drive..."):
-                gdown.download(url, model_path, quiet=False)
+                try:
+                    download_from_google_drive(FILE_ID, model_path)
+                    st.info("✅ Model downloaded successfully!")
+                except Exception as e:
+                    st.warning(f"⚠️ Download issue: {e}")
+                    
+                    # Try alternative method
+                    st.info("🔄 Trying alternative download method...")
+                    import gdown
+                    url = f"https://drive.google.com/uc?id={FILE_ID}"
+                    gdown.download(url, model_path, quiet=False, fuzzy=True)
+            
+            # Check if file exists
+            if not os.path.exists(model_path):
+                st.error("❌ Model file not found after download!")
+                return None, None, device
             
             # Load the model
             checkpoint = torch.load(model_path, map_location=device, weights_only=False)
@@ -227,48 +292,7 @@ def download_and_load_model():
             
     except Exception as e:
         st.error(f"❌ Error loading model: {e}")
-        
-        # Alternative: Try with different gdown method
-        try:
-            st.info("🔄 Trying alternative download method...")
-            
-            # Try using direct download
-            import requests
-            url = f"https://drive.google.com/uc?export=download&id={FILE_ID}"
-            
-            response = requests.get(url, stream=True)
-            
-            with tempfile.TemporaryDirectory() as tmpdir:
-                model_path = os.path.join(tmpdir, "model.pt")
-                
-                with open(model_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                
-                checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-                
-                state_dict = checkpoint.get('model_state_dict', checkpoint)
-                embedding_weight = state_dict.get('text_encoder.embedding.weight')
-                vocab_size = embedding_weight.shape[0] if embedding_weight is not None else 3423
-                
-                vocab = create_vocab(vocab_size)
-                text_encoder = BiLSTMTextEncoder(vocab_size)
-                model = MultimodalModel('efficientnet_b0', text_encoder)
-                
-                if 'model_state_dict' in checkpoint:
-                    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-                else:
-                    model.load_state_dict(checkpoint, strict=False)
-                
-                model.to(device)
-                model.eval()
-                
-                st.success("✅ Model loaded with alternative method!")
-                return model, vocab, device
-                
-        except Exception as e2:
-            st.error(f"❌ Alternative loading also failed: {e2}")
-            return None, None, device
+        return None, None, device
 
 # ============================================================================
 # GRAD-CAM FUNCTIONS
