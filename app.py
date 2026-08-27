@@ -1,5 +1,5 @@
 # ============================================================================
-# STREAMLIT APP: Emotion Detection with EfficientNet-B0 (Google Drive)
+# STREAMLIT APP: Emotion Detection with MobileNetV2 + BiLSTM
 # ============================================================================
 
 import streamlit as st
@@ -13,11 +13,8 @@ from captum.attr import LayerGradCam, LayerAttribution
 import os
 import io
 import re
-import json
-import requests
+import glob
 from datetime import datetime
-import tempfile
-import time
 
 # ============================================================================
 # PAGE CONFIGURATION
@@ -32,12 +29,6 @@ st.set_page_config(
 st.title("🎨 Emotion Detection from Children's Drawings")
 st.markdown("Upload a drawing to detect if it expresses **Happiness** or **Sadness**")
 st.markdown("---")
-
-# ============================================================================
-# GOOGLE DRIVE FILE ID (UPDATE THIS!)
-# ============================================================================
-
-FILE_ID = "1f8Ruzcy_7RfEzcEBDCnSQWAeOqs59hjZ"  # Your file ID
 
 # ============================================================================
 # MODEL ARCHITECTURE
@@ -63,13 +54,13 @@ class BiLSTMTextEncoder(nn.Module):
 def get_vision_encoder(name, pretrained=False):
     import torchvision.models as models
     backbones = {
-        'efficientnet_b0': (models.efficientnet_b0, 1280),
         'mobilenet_v2': (models.mobilenet_v2, 1280),
+        'efficientnet_b0': (models.efficientnet_b0, 1280),
         'shufflenet_v2_x1_0': (models.shufflenet_v2_x1_0, 1024),
     }
     
     if name not in backbones:
-        model_fn, dim = backbones['efficientnet_b0']
+        model_fn, dim = backbones['mobilenet_v2']
     else:
         model_fn, dim = backbones[name]
     
@@ -158,235 +149,122 @@ def text_to_sequence(text, vocab, max_len=50):
     return torch.tensor(seq, dtype=torch.long)
 
 # ============================================================================
-# GOOGLE DRIVE DOWNLOAD WITH COOKIE HANDLING (FIXED)
+# FIND MODEL FILE
 # ============================================================================
 
-def download_from_google_drive(file_id, destination):
-    """Download a file from Google Drive with proper cookie handling."""
+def find_model_file():
+    """Search for model file in multiple locations."""
     
-    # Create a session with cookies
-    session = requests.Session()
-    
-    # Step 1: Get the confirmation page
-    url = "https://drive.google.com/uc"
-    params = {'id': file_id, 'export': 'download'}
-    
-    response = session.get(url, params=params, stream=True)
-    
-    # Check if we need to confirm
-    content = response.text
-    
-    # Check for virus scan warning
-    if 'Virus scan warning' in content or 'quota exceeded' in content.lower():
-        # Try to extract the confirmation token
-        confirm_match = re.search(r'confirm=([^&"\']+)', content)
-        if confirm_match:
-            confirm_token = confirm_match.group(1)
-            params['confirm'] = confirm_token
-            response = session.get(url, params=params, stream=True)
-        else:
-            # Try the direct download URL
-            download_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
-            response = session.get(download_url, stream=True)
-    
-    # Check if we got HTML instead of the file
-    content_type = response.headers.get('Content-Type', '')
-    if 'text/html' in content_type:
-        # Check if there's a download warning
-        if 'confirm' in response.text:
-            # Extract confirmation token
-            confirm_match = re.search(r'confirm=([^&"\']+)', response.text)
-            if confirm_match:
-                confirm_token = confirm_match.group(1)
-                download_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm={confirm_token}"
-                response = session.get(download_url, stream=True)
-    
-    # Check final response
-    if response.status_code != 200:
-        raise Exception(f"Failed to download: Status {response.status_code}")
-    
-    # Verify we're not getting HTML
-    content_type = response.headers.get('Content-Type', '')
-    if 'text/html' in content_type:
-        # Try one more time with direct download
-        download_url = f"https://drive.google.com/u/0/uc?id={file_id}&export=download&confirm=t"
-        response = session.get(download_url, stream=True)
+    search_paths = [
+        # GitHub repository paths
+        "Emotion_Models/MM_MobileNetV2_BiLSTM_final.pt",
+        "Emotion_Models/compressed_models/MM_MobileNetV2_BiLSTM_final.pt",
+        "MM_MobileNetV2_BiLSTM_final.pt",
         
-        # Check again
-        content_type = response.headers.get('Content-Type', '')
-        if 'text/html' in content_type:
-            raise Exception("Still getting HTML. The file may be too large or require manual download.")
-    
-    # Save the file
-    total_size = int(response.headers.get('content-length', 0))
-    downloaded = 0
-    
-    with open(destination, 'wb') as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            if chunk:
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total_size > 0:
-                    progress = (downloaded / total_size) * 100
-                    print(f"\rDownloading: {progress:.1f}%", end='')
-    
-    print("\nDownload complete!")
-    
-    # Verify the file is a valid PyTorch file
-    try:
-        with open(destination, 'rb') as f:
-            header = f.read(10)
-            if b'PK' in header or b'<html' in header.lower():
-                raise Exception("Downloaded file appears to be HTML or ZIP, not a PyTorch model")
-    except:
-        pass
-    
-    return destination
-
-# ============================================================================
-# ALTERNATIVE: Download using gdown with proper settings
-# ============================================================================
-
-def download_with_gdown(file_id, destination):
-    """Download using gdown with proper settings."""
-    import gdown
-    
-    # Try different URL formats
-    urls = [
-        f"https://drive.google.com/uc?id={file_id}",
-        f"https://drive.google.com/uc?export=download&id={file_id}",
-        f"https://drive.google.com/file/d/{file_id}/view"
+        # Alternative paths
+        "*.pt",
     ]
     
-    for url in urls:
-        try:
-            print(f"Trying: {url}")
-            gdown.download(url, destination, quiet=False, fuzzy=True)
-            
-            # Check if file was downloaded
-            if os.path.exists(destination) and os.path.getsize(destination) > 1024:
-                # Verify it's not HTML
-                with open(destination, 'rb') as f:
-                    header = f.read(100)
-                    if b'<html' not in header.lower() and b'<!DOCTYPE' not in header:
-                        print("Download successful!")
-                        return destination
-            print("Download failed for this URL, trying next...")
-        except Exception as e:
-            print(f"Error with {url}: {e}")
-            continue
+    for path in search_paths:
+        if os.path.exists(path):
+            return path
+        
+        if '*' in path:
+            matches = glob.glob(path)
+            if matches:
+                return matches[0]
     
-    raise Exception("All download methods failed")
+    # Search all subdirectories
+    for root, dirs, files in os.walk('.'):
+        for file in files:
+            if file.endswith('.pt'):
+                return os.path.join(root, file)
+    
+    return None
 
 # ============================================================================
-# LOAD MODEL FROM GOOGLE DRIVE
+# LOAD MODEL
 # ============================================================================
 
 @st.cache_resource
-def download_and_load_model():
+def load_cached_model():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    if not FILE_ID or FILE_ID == "YOUR_FILE_ID_HERE":
-        st.error("❌ Google Drive File ID not set!")
+    # Find model file
+    model_path = find_model_file()
+    
+    if model_path is None:
+        st.error("""
+        ❌ **Model file not found!**
+        
+        Expected: `Emotion_Models/MM_MobileNetV2_BiLSTM_final.pt`
+        
+        Please ensure the model file is uploaded to your GitHub repository.
+        """)
+        
+        # Show available files
+        st.subheader("📁 Available Files:")
+        files = []
+        for root, dirs, filenames in os.walk('.'):
+            for f in filenames:
+                if f.endswith('.pt') or f.endswith('.pth'):
+                    files.append(os.path.join(root, f))
+        
+        if files:
+            st.write("Found these model files:")
+            for f in files:
+                st.write(f"   - `{f}`")
+        else:
+            st.write("No `.pt` or `.pth` files found.")
+            
         return None, None, device
     
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            model_path = os.path.join(tmpdir, "model.pt")
-            
-            # Try multiple download methods
-            download_success = False
-            
-            # Method 1: Custom download with cookie handling
-            try:
-                with st.spinner("📥 Downloading model from Google Drive (Method 1)..."):
-                    download_from_google_drive(FILE_ID, model_path)
-                    download_success = True
-                    st.info("✅ Method 1 successful!")
-            except Exception as e:
-                st.warning(f"Method 1 failed: {e}")
-            
-            # Method 2: gdown with fuzzy matching
-            if not download_success:
-                try:
-                    with st.spinner("📥 Downloading model from Google Drive (Method 2)..."):
-                        download_with_gdown(FILE_ID, model_path)
-                        download_success = True
-                        st.info("✅ Method 2 successful!")
-                except Exception as e:
-                    st.warning(f"Method 2 failed: {e}")
-            
-            # Method 3: Manual link (provide instructions)
-            if not download_success:
-                st.error("""
-                ❌ **Automatic download failed.**
-                
-                Please manually download the model file from Google Drive and upload it to your repository.
-                
-                **Steps:**
-                1. Go to: https://drive.google.com/file/d/""" + FILE_ID + """/view
-                2. Click "Download"
-                3. Upload the file to `Emotion_Models/MM_EfficientNet_B0_BiLSTM_final.pt`
-                4. Restart the app
-                """)
-                return None, None, device
-            
-            # Check if file exists
-            if not os.path.exists(model_path):
-                st.error("❌ Model file not found after download!")
-                return None, None, device
-            
-            # Check file size
-            file_size = os.path.getsize(model_path) / (1024 * 1024)
-            if file_size < 1:
-                st.error(f"❌ File too small ({file_size:.2f} MB). Likely an HTML error page.")
-                return None, None, device
-            
-            # Load the model
-            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-            
-            # Get vocabulary size from embedding
-            state_dict = checkpoint.get('model_state_dict', checkpoint)
-            embedding_weight = state_dict.get('text_encoder.embedding.weight')
-            
-            if embedding_weight is not None:
-                vocab_size = embedding_weight.shape[0]
-            else:
-                vocab_size = 3423
-            
-            # Create vocabulary
-            vocab = create_vocab(vocab_size)
-            
-            # Create model
-            text_encoder = BiLSTMTextEncoder(vocab_size)
-            model = MultimodalModel('efficientnet_b0', text_encoder)
-            
-            # Load weights
-            if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-            else:
-                model.load_state_dict(checkpoint, strict=False)
-            
-            model.to(device)
-            model.eval()
-            
-            st.success(f"✅ Model loaded successfully from Google Drive!")
-            st.info(f"📊 Vocabulary size: {vocab_size}")
-            st.info(f"📦 File size: {file_size:.2f} MB")
-            
-            return model, vocab, device
-            
+        # Load checkpoint
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+        
+        # Get vocabulary size from embedding
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        embedding_weight = state_dict.get('text_encoder.embedding.weight')
+        
+        if embedding_weight is not None:
+            vocab_size = embedding_weight.shape[0]
+        else:
+            vocab_size = 3423
+        
+        st.info(f"📊 Using vocabulary size: {vocab_size}")
+        
+        # Create vocabulary with correct size
+        vocab = create_vocab(vocab_size)
+        
+        # Create model with correct vocab size
+        text_encoder = BiLSTMTextEncoder(vocab_size)
+        model = MultimodalModel('mobilenet_v2', text_encoder)
+        
+        # Load weights
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        else:
+            model.load_state_dict(checkpoint, strict=False)
+        
+        model.to(device)
+        model.eval()
+        
+        file_size = os.path.getsize(model_path) / (1024 * 1024)
+        
+        st.success(f"✅ Model loaded from `{os.path.basename(model_path)}` ({file_size:.2f} MB)")
+        st.info(f"📊 Model: MobileNetV2 + BiLSTM")
+        st.info(f"📊 Vocabulary size: {vocab_size}")
+        
+        return model, vocab, device
+        
     except Exception as e:
         st.error(f"❌ Error loading model: {e}")
         
-        # Show helpful message
-        st.info("""
-        💡 **Troubleshooting:**
-        
-        1. Make sure the file is shared with "Anyone with the link"
-        2. Check that the FILE_ID is correct
-        3. Try manually downloading and uploading to the repository
-        """)
+        # Show helpful debug info
+        st.subheader("🔍 Debug Information:")
+        st.code(f"Model path: {model_path}")
+        st.code(f"File size: {os.path.getsize(model_path) / (1024 * 1024):.2f} MB")
         
         return None, None, device
 
@@ -395,7 +273,7 @@ def download_and_load_model():
 # ============================================================================
 
 def get_target_layer(model):
-    """Find the last convolutional layer for EfficientNet-B0."""
+    """Find the last convolutional layer for MobileNetV2."""
     vision = model.vision
     
     if hasattr(vision, 'features'):
@@ -408,15 +286,7 @@ def get_target_layer(model):
                         return module
                 return vision.features._modules[keys[-1]]
     
-    if hasattr(vision, 'blocks'):
-        if hasattr(vision.blocks, '_modules'):
-            keys = list(vision.blocks._modules.keys())
-            if keys:
-                last_block = vision.blocks._modules[keys[-1]]
-                for name, module in last_block.named_modules():
-                    if isinstance(module, nn.Conv2d):
-                        return module
-    
+    # Fallback
     for name, module in vision.named_modules():
         if isinstance(module, nn.Conv2d):
             return module
@@ -539,8 +409,8 @@ def normalize_image(tensor):
 # ============================================================================
 
 def main():
-    # Download and load model
-    model, vocab, device = download_and_load_model()
+    # Load model
+    model, vocab, device = load_cached_model()
     
     if model is None:
         st.stop()
