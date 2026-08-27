@@ -132,7 +132,6 @@ def create_vocab(vocab_size=3423):
     for i, word in enumerate(common_words, 2):
         vocab[word] = i
     
-    # Fill remaining vocabulary with placeholder tokens
     current_size = len(vocab)
     for i in range(current_size, vocab_size):
         vocab[f'<TOKEN_{i}>'] = i
@@ -153,28 +152,21 @@ def text_to_sequence(text, vocab, max_len=50):
 # ============================================================================
 
 def find_model_file():
-    """Search for model file in multiple locations."""
-    
     search_paths = [
-        # GitHub repository paths
         "Emotion_Models/MM_MobileNetV2_BiLSTM_final.pt",
         "Emotion_Models/compressed_models/MM_MobileNetV2_BiLSTM_final.pt",
         "MM_MobileNetV2_BiLSTM_final.pt",
-        
-        # Alternative paths
         "*.pt",
     ]
     
     for path in search_paths:
         if os.path.exists(path):
             return path
-        
         if '*' in path:
             matches = glob.glob(path)
             if matches:
                 return matches[0]
     
-    # Search all subdirectories
     for root, dirs, files in os.walk('.'):
         for file in files:
             if file.endswith('.pt'):
@@ -189,41 +181,14 @@ def find_model_file():
 @st.cache_resource
 def load_cached_model():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Find model file
     model_path = find_model_file()
     
     if model_path is None:
-        st.error("""
-        ❌ **Model file not found!**
-        
-        Expected: `Emotion_Models/MM_MobileNetV2_BiLSTM_final.pt`
-        
-        Please ensure the model file is uploaded to your GitHub repository.
-        """)
-        
-        # Show available files
-        st.subheader("📁 Available Files:")
-        files = []
-        for root, dirs, filenames in os.walk('.'):
-            for f in filenames:
-                if f.endswith('.pt') or f.endswith('.pth'):
-                    files.append(os.path.join(root, f))
-        
-        if files:
-            st.write("Found these model files:")
-            for f in files:
-                st.write(f"   - `{f}`")
-        else:
-            st.write("No `.pt` or `.pth` files found.")
-            
+        st.error("❌ Model file not found!")
         return None, None, device
     
     try:
-        # Load checkpoint
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-        
-        # Get vocabulary size from embedding
         state_dict = checkpoint.get('model_state_dict', checkpoint)
         embedding_weight = state_dict.get('text_encoder.embedding.weight')
         
@@ -232,16 +197,10 @@ def load_cached_model():
         else:
             vocab_size = 3423
         
-        st.info(f"📊 Using vocabulary size: {vocab_size}")
-        
-        # Create vocabulary with correct size
         vocab = create_vocab(vocab_size)
-        
-        # Create model with correct vocab size
         text_encoder = BiLSTMTextEncoder(vocab_size)
         model = MultimodalModel('mobilenet_v2', text_encoder)
         
-        # Load weights
         if 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         else:
@@ -250,22 +209,10 @@ def load_cached_model():
         model.to(device)
         model.eval()
         
-        file_size = os.path.getsize(model_path) / (1024 * 1024)
-        
-        st.success(f"✅ Model loaded from `{os.path.basename(model_path)}` ({file_size:.2f} MB)")
-        st.info(f"📊 Model: MobileNetV2 + BiLSTM")
-        st.info(f"📊 Vocabulary size: {vocab_size}")
-        
         return model, vocab, device
         
     except Exception as e:
         st.error(f"❌ Error loading model: {e}")
-        
-        # Show helpful debug info
-        st.subheader("🔍 Debug Information:")
-        st.code(f"Model path: {model_path}")
-        st.code(f"File size: {os.path.getsize(model_path) / (1024 * 1024):.2f} MB")
-        
         return None, None, device
 
 # ============================================================================
@@ -273,7 +220,6 @@ def load_cached_model():
 # ============================================================================
 
 def get_target_layer(model):
-    """Find the last convolutional layer for MobileNetV2."""
     vision = model.vision
     
     if hasattr(vision, 'features'):
@@ -286,7 +232,6 @@ def get_target_layer(model):
                         return module
                 return vision.features._modules[keys[-1]]
     
-    # Fallback
     for name, module in vision.named_modules():
         if isinstance(module, nn.Conv2d):
             return module
@@ -294,7 +239,6 @@ def get_target_layer(model):
     return vision
 
 def get_layerwise_layers(model):
-    """Get multiple convolutional layers for layer-wise Grad-CAM."""
     layers = []
     layer_names = []
     vision = model.vision
@@ -321,9 +265,7 @@ def get_layerwise_layers(model):
     return layers, layer_names
 
 def generate_gradcam_heatmap(model, image, target_class, layer_idx=0):
-    """Generate Grad-CAM heatmap for a specific layer."""
     device = next(model.parameters()).device
-    
     target_layer = get_target_layer(model)
     
     if layer_idx > 0:
@@ -351,7 +293,6 @@ def generate_gradcam_heatmap(model, image, target_class, layer_idx=0):
     return heatmap
 
 def generate_layerwise_gradcam(model, image, target_class):
-    """Generate layer-wise Grad-CAM for all layers."""
     layers, layer_names = get_layerwise_layers(model)
     heatmaps = []
     
@@ -378,7 +319,6 @@ def generate_layerwise_gradcam(model, image, target_class):
     return heatmaps, layer_names
 
 def overlay_heatmap_jet(image, heatmap, alpha=0.5):
-    """Overlay heatmap with jet colormap using matplotlib."""
     if isinstance(image, torch.Tensor):
         img = image.squeeze().cpu().permute(1, 2, 0).numpy()
         img = np.clip(img, 0, 1)
@@ -395,7 +335,6 @@ def overlay_heatmap_jet(image, heatmap, alpha=0.5):
     return np.clip(overlay, 0, 1)
 
 def normalize_image(tensor):
-    """Normalize image tensor for display."""
     img = tensor.cpu().detach().numpy()
     if img.ndim == 4:
         img = img.squeeze(0)
@@ -409,13 +348,11 @@ def normalize_image(tensor):
 # ============================================================================
 
 def main():
-    # Load model
     model, vocab, device = load_cached_model()
     
     if model is None:
         st.stop()
     
-    # Create tabs
     tab1, tab2 = st.tabs(["📤 Upload & Predict", "🔍 Layer-wise XAI"])
     
     # ========================================================================
@@ -430,8 +367,7 @@ def main():
         with col1:
             uploaded_file = st.file_uploader(
                 "Choose an image file...",
-                type=["jpg", "jpeg", "png"],
-                help="Upload a drawing to analyze the emotion"
+                type=["jpg", "jpeg", "png"]
             )
             
             st.subheader("Child's Explanation (Optional)")
@@ -495,10 +431,10 @@ def main():
     
     with tab2:
         st.header("🔍 Layer-wise Grad-CAM Explanation")
-        st.markdown("Shows which parts of the drawing influenced the model's decision at different network layers.")
+        st.markdown("Shows which parts of the drawing influenced the model's decision.")
         
         if 'current_image' not in st.session_state:
-            st.info("Please upload an image and make a prediction first in the 'Upload & Predict' tab.")
+            st.info("Please upload an image and make a prediction first.")
         else:
             image_tensor = st.session_state['current_image']
             pred_class = st.session_state['current_pred']
@@ -536,16 +472,15 @@ def main():
                     col1, col2, col3 = st.columns(3)
                     
                     with col1:
-                        st.image(img_display, caption="Original Image", use_container_width=True)
+                        st.image(img_display, caption="Original", use_container_width=True)
                     
                     with col2:
-                        st.image(heatmap, caption=f"Heatmap\n{selected_layer}", use_container_width=True)
+                        st.image(heatmap, caption="Heatmap", use_container_width=True)
                     
                     with col3:
                         st.image(overlay, caption="Overlay", use_container_width=True)
                     
                     st.subheader("Layer-wise Grad-CAM Grid")
-                    st.markdown("All layers side-by-side for comparison")
                     
                     with st.spinner("Generating all layers..."):
                         heatmaps, layer_names = generate_layerwise_gradcam(
@@ -576,7 +511,7 @@ def main():
                     
                     if pred_class == 0:
                         st.success(f"""
-                        **The model focused on regions that typically indicate happiness:**
+                        **The model focused on regions indicating happiness:**
                         - Most focused layer: **{best_layer_name}**
                         - Areas around the eyes and mouth (smile indicators)
                         - Bright/positive color regions
@@ -584,7 +519,7 @@ def main():
                         """)
                     else:
                         st.warning(f"""
-                        **The model focused on regions that typically indicate sadness:**
+                        **The model focused on regions indicating sadness:**
                         - Most focused layer: **{best_layer_name}**
                         - Areas around the eyes (drooping indicators)
                         - Darker/shadow regions
