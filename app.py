@@ -1,6 +1,4 @@
-# ============================================================================
 # STREAMLIT APP: Emotion Detection with MobileNetV2 + BiLSTM
-# ============================================================================
 
 import streamlit as st
 import torch
@@ -16,23 +14,20 @@ import re
 import glob
 from datetime import datetime
 
-# ============================================================================
 # PAGE CONFIGURATION
-# ============================================================================
 
 st.set_page_config(
     page_title="Emotion Detection from Children's Drawings",
-    page_icon="🎨",
+    page_icon="",
     layout="wide"
 )
 
-st.title("🎨 Emotion Detection from Children's Drawings")
+st.title("Emotion Detection from Children's Drawings")
 st.markdown("Upload a drawing to detect if it expresses **Happiness** or **Sadness**")
 st.markdown("---")
 
-# ============================================================================
+
 # MODEL ARCHITECTURE
-# ============================================================================
 
 class BiLSTMTextEncoder(nn.Module):
     def __init__(self, vocab_size=3423, embed_dim=300, hidden=128, dropout=0.3):
@@ -107,9 +102,8 @@ class MultimodalModel(nn.Module):
         fused = torch.cat([v, t], dim=1)
         return self.classifier(fused)
 
-# ============================================================================
+
 # VOCABULARY
-# ============================================================================
 
 def create_vocab(vocab_size=3423):
     """Create a vocabulary with the specified size."""
@@ -147,9 +141,7 @@ def text_to_sequence(text, vocab, max_len=50):
     seq += [0] * (max_len - len(seq))
     return torch.tensor(seq, dtype=torch.long)
 
-# ============================================================================
 # FIND MODEL FILE
-# ============================================================================
 
 def find_model_file():
     search_paths = [
@@ -174,9 +166,7 @@ def find_model_file():
     
     return None
 
-# ============================================================================
 # LOAD MODEL
-# ============================================================================
 
 @st.cache_resource
 def load_cached_model():
@@ -184,7 +174,7 @@ def load_cached_model():
     model_path = find_model_file()
     
     if model_path is None:
-        st.error("❌ Model file not found!")
+        st.error("Model file not found!")
         return None, None, device
     
     try:
@@ -215,9 +205,8 @@ def load_cached_model():
         st.error(f"❌ Error loading model: {e}")
         return None, None, device
 
-# ============================================================================
+
 # GRAD-CAM FUNCTIONS
-# ============================================================================
 
 def get_target_layer(model):
     vision = model.vision
@@ -343,9 +332,8 @@ def normalize_image(tensor):
     img = np.clip(img, 0, 1)
     return img
 
-# ============================================================================
+
 # MAIN APP
-# ============================================================================
 
 def main():
     model, vocab, device = load_cached_model()
@@ -353,11 +341,10 @@ def main():
     if model is None:
         st.stop()
     
-    tab1, tab2 = st.tabs(["📤 Upload & Predict", "🔍 Layer-wise XAI"])
+    tab1, tab2 = st.tabs(["Upload & Predict", "Layer-wise XAI"])
     
-    # ========================================================================
+
     # TAB 1: Upload & Predict
-    # ========================================================================
     
     with tab1:
         st.header("Upload a Drawing")
@@ -377,7 +364,7 @@ def main():
                 height=80
             )
             
-            predict_button = st.button("🔮 Predict Emotion", type="primary", use_container_width=True)
+            predict_button = st.button(" Predict Emotion", type="primary", use_container_width=True)
         
         with col2:
             if uploaded_file is not None:
@@ -406,7 +393,7 @@ def main():
                             emotion = "Happy 😊" if pred == 0 else "Sad 😢"
                             confidence = probs[0][pred].item()
                             
-                            st.subheader("📊 Prediction Result")
+                            st.subheader(" Prediction Result")
                             
                             bg_color = '#d4edda' if pred == 0 else '#f8d7da'
                             
@@ -425,12 +412,10 @@ def main():
                         except Exception as e:
                             st.error(f"Error during prediction: {e}")
     
-    # ========================================================================
     # TAB 2: Layer-wise XAI
-    # ========================================================================
     
     with tab2:
-        st.header("🔍 Layer-wise Grad-CAM Explanation")
+        st.header(" Layer-wise Grad-CAM Explanation")
         st.markdown("Shows which parts of the drawing influenced the model's decision.")
         
         if 'current_image' not in st.session_state:
@@ -499,7 +484,7 @@ def main():
                                 overlay_hm = overlay_heatmap_jet(img_display, hm, alpha)
                                 st.image(overlay_hm, caption=f"{name[:12]}", use_container_width=True)
                     
-                    st.subheader("📖 Interpretation")
+                    st.subheader("Interpretation")
                     
                     focus_scores = []
                     for hm in heatmaps:
@@ -526,7 +511,7 @@ def main():
                         - Closed/withdrawn body language features
                         """)
                     
-                    st.subheader("📥 Export Explanation")
+                    st.subheader("Export Explanation")
                     
                     fig, axes = plt.subplots(2, len(heatmaps) + 1, figsize=(20, 8))
                     
@@ -556,12 +541,6 @@ def main():
                     plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
                     buf.seek(0)
                     
-                    st.download_button(
-                        label="📥 Download Layer-wise Grad-CAM",
-                        data=buf.getvalue(),
-                        file_name=f"layerwise_gradcam_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                        mime="image/png"
-                    )
                     plt.close()
                     
                 except Exception as e:
@@ -569,9 +548,8 @@ def main():
                     import traceback
                     st.code(traceback.format_exc())
 
-# ============================================================================
+
 # RUN APP
-# ============================================================================
 
 if __name__ == "__main__":
     main()
