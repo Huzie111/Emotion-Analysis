@@ -10,10 +10,9 @@ import os
 import io
 import re
 import glob
-from datetime import datetime
 
 st.set_page_config(
-    page_title="Emotion Detection from Children's Drawings",
+    page_title="Emotion Detection",
     page_icon="🎨",
     layout="wide"
 )
@@ -178,7 +177,7 @@ def load_cached_model():
         return None, None, device
 
 
-def get_target_layer(model):
+def get_feature_layer_5(model):
     vision = model.vision
     if hasattr(vision, 'features') and hasattr(vision.features, '_modules'):
         keys = list(vision.features._modules.keys())
@@ -196,7 +195,7 @@ def get_target_layer(model):
 
 def generate_gradcam_heatmap(model, image, target_class):
     device = next(model.parameters()).device
-    target_layer = get_target_layer(model)
+    target_layer = get_feature_layer_5(model)
     grad_cam = LayerGradCam(model, target_layer)
     dummy_text = torch.zeros(1, 50, dtype=torch.long).to(device)
     attributions = grad_cam.attribute(
@@ -305,8 +304,6 @@ def main():
         if 'current_image' in st.session_state and st.session_state.get('current_image') is not None:
             image_tensor = st.session_state['current_image']
             pred_class = st.session_state['current_pred']
-            pil_image = st.session_state['current_pil']
-            emotion = st.session_state.get('emotion', '')
 
             alpha = st.slider("Heatmap Opacity:", 0.1, 1.0, 0.5, 0.1)
 
@@ -329,6 +326,33 @@ def main():
 
                 except Exception as e:
                     st.error(f"Error generating explanation: {e}")
+
+                # Prediction output below explanation - BIG and visible
+                emotion = st.session_state.get('emotion', '')
+                confidence = st.session_state.get('confidence', 0)
+
+                st.markdown("---")
+
+                if emotion == "Happy":
+                    st.markdown(
+                        f"""
+                        <div style="background-color: #d4edda; padding: 20px; border-radius: 10px; text-align: center;">
+                            <h1 style="font-size: 48px; margin: 0; color: #155724;">HAPPY</h1>
+                            <p style="font-size: 24px; margin: 5px 0 0 0; color: #155724;">{confidence:.1%} confidence</p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+                else:
+                    st.markdown(
+                        f"""
+                        <div style="background-color: #f8d7da; padding: 20px; border-radius: 10px; text-align: center;">
+                            <h1 style="font-size: 48px; margin: 0; color: #721c24;">SAD</h1>
+                            <p style="font-size: 24px; margin: 5px 0 0 0; color: #721c24;">{confidence:.1%} confidence</p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
         else:
             st.info("Upload an image and click 'Predict' to see the explanation.")
 
