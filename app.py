@@ -27,7 +27,6 @@ st.set_page_config(
 )
 
 st.title("🎨 Emotion Detection from Children's Drawings")
-st.markdown("Upload a drawing to detect if it expresses **Happiness** or **Sadness**")
 st.markdown("---")
 
 # ============================================================================
@@ -112,7 +111,6 @@ class MultimodalModel(nn.Module):
 # ============================================================================
 
 def create_vocab(vocab_size=3423):
-    """Create a vocabulary with the specified size."""
     vocab = {'<PAD>': 0, '<UNK>': 1}
     
     common_words = [
@@ -246,32 +244,33 @@ def get_layerwise_layers(model):
     if hasattr(vision, 'features'):
         if hasattr(vision.features, '_modules'):
             keys = list(vision.features._modules.keys())
-            selected_indices = [0, len(keys)//4, len(keys)//2, 3*len(keys)//4, -1]
-            for idx in selected_indices:
-                if abs(idx) < len(keys):
-                    module = vision.features._modules[keys[idx]]
-                    if isinstance(module, nn.Conv2d):
-                        layers.append(module)
-                        layer_names.append(f"Layer {keys[idx]}")
+            if keys:
+                # Get the last layer (Feature Layer 5 - Late)
+                module = vision.features._modules[keys[-1]]
+                if isinstance(module, nn.Conv2d):
+                    layers.append(module)
+                    layer_names.append("Feature Layer 5 (Late)")
     
-    if len(layers) < 3:
+    if len(layers) == 0:
         for name, module in vision.named_modules():
             if isinstance(module, nn.Conv2d):
                 layers.append(module)
-                layer_names.append(name.split('.')[-1])
-                if len(layers) >= 5:
-                    break
+                layer_names.append("Feature Layer 5 (Late)")
+                break
     
     return layers, layer_names
 
-def generate_gradcam_heatmap(model, image, target_class, layer_idx=0):
+def generate_gradcam_heatmap(model, image, target_class):
     device = next(model.parameters()).device
-    target_layer = get_target_layer(model)
     
-    if layer_idx > 0:
-        layers, layer_names = get_layerwise_layers(model)
-        if layer_idx <= len(layers):
-            target_layer = layers[layer_idx - 1]
+    # Get Feature Layer 5 (Late) only
+    layers, layer_names = get_layerwise_layers(model)
+    
+    if not layers:
+        st.error("❌ Could not find target layer")
+        return np.zeros((224, 224))
+    
+    target_layer = layers[0]
     
     grad_cam = LayerGradCam(model, target_layer)
     dummy_text = torch.zeros(1, 50, dtype=torch.long).to(device)
@@ -291,32 +290,6 @@ def generate_gradcam_heatmap(model, image, target_class, layer_idx=0):
     heatmap = heatmap.squeeze().cpu().detach().numpy()
     heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
     return heatmap
-
-def generate_layerwise_gradcam(model, image, target_class):
-    layers, layer_names = get_layerwise_layers(model)
-    heatmaps = []
-    
-    for i, (layer, name) in enumerate(zip(layers, layer_names)):
-        grad_cam = LayerGradCam(model, layer)
-        dummy_text = torch.zeros(1, 50, dtype=torch.long).to(next(model.parameters()).device)
-        
-        attributions = grad_cam.attribute(
-            image, target=target_class, additional_forward_args=(dummy_text,)
-        )
-        
-        if attributions.dim() == 4:
-            heatmap = LayerAttribution.interpolate(attributions, (224, 224))
-        elif attributions.dim() == 3:
-            attributions = attributions.unsqueeze(1)
-            heatmap = LayerAttribution.interpolate(attributions, (224, 224))
-        else:
-            heatmap = torch.ones(1, 1, 224, 224).to(device)
-        
-        heatmap = heatmap.squeeze().cpu().detach().numpy()
-        heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
-        heatmaps.append(heatmap)
-    
-    return heatmaps, layer_names
 
 def overlay_heatmap_jet(image, heatmap, alpha=0.5):
     if isinstance(image, torch.Tensor):
@@ -353,203 +326,130 @@ def main():
     if model is None:
         st.stop()
     
-    tab1, tab2 = st.tabs(["📤 Upload & Predict", "🔍 Layer-wise XAI"])
+    # Single tab layout
+    col_left, col_right = st.columns([1, 1])
     
     # ========================================================================
-    # TAB 1: Upload & Predict
+    # LEFT COLUMN: Upload & Predict
     # ========================================================================
     
-    with tab1:
-        st.header("Upload a Drawing")
+    with col_left:
+        st.subheader("📤 Upload")
         
-        col1, col2 = st.columns([1, 1])
+        uploaded_file = st.file_uploader(
+            "Choose an image...",
+            type=["jpg", "jpeg", "png"],
+            label_visibility="collapsed"
+        )
         
-        with col1:
-            uploaded_file = st.file_uploader(
-                "Choose an image file...",
-                type=["jpg", "jpeg", "png"]
-            )
+        child_text = st.text_area(
+            "Child's Explanation (Optional)",
+            placeholder="e.g., I drew this because I was happy...",
+            height=60,
+            label_visibility="collapsed"
+        )
+        
+        predict_button = st.button("🔮 Predict", type="primary", use_container_width=True)
+        
+        if uploaded_file is not None:
+            image = Image.open(uploaded_file).convert('RGB')
+            st.image(image, caption="Uploaded Drawing", use_container_width=True)
             
-            st.subheader("Child's Explanation (Optional)")
-            child_text = st.text_area(
-                "What did the child say about their drawing?",
-                placeholder="e.g., I drew this because I was happy...",
-                height=80
-            )
-            
-            predict_button = st.button("🔮 Predict Emotion", type="primary", use_container_width=True)
-        
-        with col2:
-            if uploaded_file is not None:
-                image = Image.open(uploaded_file).convert('RGB')
-                st.image(image, caption="Uploaded Drawing", use_container_width=True)
-                
-                if predict_button:
-                    with st.spinner("Analyzing..."):
-                        try:
-                            transform = transforms.Compose([
-                                transforms.Resize((224, 224)),
-                                transforms.ToTensor(),
-                            ])
-                            img_tensor = transform(image).unsqueeze(0).to(device)
-                            
-                            if child_text:
-                                text_tensor = text_to_sequence(child_text, vocab).unsqueeze(0).to(device)
-                            else:
-                                text_tensor = torch.zeros(1, 50, dtype=torch.long).to(device)
-                            
-                            with torch.no_grad():
-                                output = model(img_tensor, text_tensor)
-                                probs = torch.softmax(output, dim=1)
-                                pred = torch.argmax(probs, dim=1).item()
-                            
-                            emotion = "Happy 😊" if pred == 0 else "Sad 😢"
-                            confidence = probs[0][pred].item()
-                            
-                            st.subheader("📊 Prediction Result")
-                            
-                            bg_color = '#d4edda' if pred == 0 else '#f8d7da'
-                            
-                            st.markdown(f"""
-                            <div style="text-align: center; padding: 20px; background-color: {bg_color}; border-radius: 10px;">
-                                <h1 style="font-size: 48px; margin: 0;">{emotion}</h1>
-                                <p style="font-size: 24px; margin: 0;">Confidence: {confidence:.1%}</p>
-                            </div>
-                            """, unsafe_allow_html=True)
-                            
-                            st.session_state['current_image'] = img_tensor
-                            st.session_state['current_pred'] = pred
-                            st.session_state['current_probs'] = probs
-                            st.session_state['current_pil'] = image
-                            
-                        except Exception as e:
-                            st.error(f"Error during prediction: {e}")
+            if predict_button:
+                with st.spinner("Analyzing..."):
+                    try:
+                        transform = transforms.Compose([
+                            transforms.Resize((224, 224)),
+                            transforms.ToTensor(),
+                        ])
+                        img_tensor = transform(image).unsqueeze(0).to(device)
+                        
+                        if child_text:
+                            text_tensor = text_to_sequence(child_text, vocab).unsqueeze(0).to(device)
+                        else:
+                            text_tensor = torch.zeros(1, 50, dtype=torch.long).to(device)
+                        
+                        with torch.no_grad():
+                            output = model(img_tensor, text_tensor)
+                            probs = torch.softmax(output, dim=1)
+                            pred = torch.argmax(probs, dim=1).item()
+                        
+                        emotion = "Happy 😊" if pred == 0 else "Sad 😢"
+                        confidence = probs[0][pred].item()
+                        
+                        st.session_state['emotion'] = emotion
+                        st.session_state['confidence'] = confidence
+                        st.session_state['current_image'] = img_tensor
+                        st.session_state['current_pred'] = pred
+                        st.session_state['current_pil'] = image
+                        
+                        st.success(f"**{emotion}** — {confidence:.1%} confidence")
+                        
+                    except Exception as e:
+                        st.error(f"Error: {e}")
     
     # ========================================================================
-    # TAB 2: Layer-wise XAI
+    # RIGHT COLUMN: Layer-wise XAI (Feature 5 - Late)
     # ========================================================================
     
-    with tab2:
-        st.header("🔍 Layer-wise Grad-CAM Explanation")
-        st.markdown("Shows which parts of the drawing influenced the model's decision.")
+    with col_right:
+        st.subheader("🔍 Explanation (Feature Layer 5 - Late)")
         
-        if 'current_image' not in st.session_state:
-            st.info("Please upload an image and make a prediction first.")
-        else:
+        if 'current_image' in st.session_state and st.session_state.get('current_image') is not None:
             image_tensor = st.session_state['current_image']
             pred_class = st.session_state['current_pred']
             pil_image = st.session_state['current_pil']
+            emotion = st.session_state.get('emotion', '')
             
-            st.subheader("Layer Selection")
-            col1, col2 = st.columns([1, 1])
-            
-            with col1:
-                layer_options = [
-                    "Feature Layer 1 (Early)",
-                    "Feature Layer 2 (Mid-Early)",
-                    "Feature Layer 3 (Mid)",
-                    "Feature Layer 4 (Mid-Late)",
-                    "Feature Layer 5 (Late)"
-                ]
-                selected_layer = st.selectbox("Select Layer:", layer_options)
-            
-            with col2:
-                alpha = st.slider("Heatmap Opacity:", 0.1, 1.0, 0.5, 0.1)
-                target_label = "Happy" if pred_class == 0 else "Sad"
-                st.write(f"**Target Class:** {target_label}")
+            alpha = st.slider("Heatmap Opacity:", 0.1, 1.0, 0.5, 0.1)
             
             with st.spinner("Generating explanation..."):
                 try:
-                    layer_idx = layer_options.index(selected_layer)
-                    
                     heatmap = generate_gradcam_heatmap(
-                        model, image_tensor, pred_class, layer_idx
+                        model, image_tensor, pred_class
                     )
                     
                     img_display = normalize_image(image_tensor)
                     overlay = overlay_heatmap_jet(img_display, heatmap, alpha)
                     
-                    col1, col2, col3 = st.columns(3)
+                    # Display in a compact grid
+                    col_a, col_b, col_c = st.columns(3)
                     
-                    with col1:
+                    with col_a:
                         st.image(img_display, caption="Original", use_container_width=True)
                     
-                    with col2:
-                        st.image(heatmap, caption="Heatmap", use_container_width=True)
+                    with col_b:
+                        st.image(heatmap, caption="Heatmap", use_container_width=True, clamp=True)
                     
-                    with col3:
+                    with col_c:
                         st.image(overlay, caption="Overlay", use_container_width=True)
                     
-                    st.subheader("Layer-wise Grad-CAM Grid")
-                    
-                    with st.spinner("Generating all layers..."):
-                        heatmaps, layer_names = generate_layerwise_gradcam(
-                            model, image_tensor, pred_class
-                        )
-                        
-                        cols = st.columns(len(heatmaps))
-                        for i, (col, hm, name) in enumerate(zip(cols, heatmaps, layer_names)):
-                            with col:
-                                st.image(hm, caption=f"{name[:12]}", use_container_width=True)
-                        
-                        st.markdown("### Overlay Grid")
-                        cols_overlay = st.columns(len(heatmaps))
-                        for i, (col, hm, name) in enumerate(zip(cols_overlay, heatmaps, layer_names)):
-                            with col:
-                                overlay_hm = overlay_heatmap_jet(img_display, hm, alpha)
-                                st.image(overlay_hm, caption=f"{name[:12]}", use_container_width=True)
-                    
-                    st.subheader("📖 Interpretation")
-                    
-                    focus_scores = []
-                    for hm in heatmaps:
-                        focus = (hm > 0.5).mean()
-                        focus_scores.append(focus)
-                    
-                    best_layer_idx = np.argmax(focus_scores)
-                    best_layer_name = layer_names[best_layer_idx] if best_layer_idx < len(layer_names) else "Unknown"
-                    
+                    # Interpretation
                     if pred_class == 0:
-                        st.success(f"""
-                        **The model focused on regions indicating happiness:**
-                        - Most focused layer: **{best_layer_name}**
-                        - Areas around the eyes and mouth (smile indicators)
-                        - Bright/positive color regions
-                        - Open body language features
+                        st.success("""
+                        ✅ **Happy**: Model focused on smile indicators, bright colors, and open expressions
                         """)
                     else:
-                        st.warning(f"""
-                        **The model focused on regions indicating sadness:**
-                        - Most focused layer: **{best_layer_name}**
-                        - Areas around the eyes (drooping indicators)
-                        - Darker/shadow regions
-                        - Closed/withdrawn body language features
+                        st.warning("""
+                        ⚠️ **Sad**: Model focused on drooping indicators, shadow regions, and closed expressions
                         """)
                     
-                    st.subheader("📥 Export Explanation")
+                    # Download button
+                    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
                     
-                    fig, axes = plt.subplots(2, len(heatmaps) + 1, figsize=(20, 8))
+                    axes[0].imshow(img_display)
+                    axes[0].set_title('Original')
+                    axes[0].axis('off')
                     
-                    axes[0, 0].imshow(img_display)
-                    axes[0, 0].set_title('Original')
-                    axes[0, 0].axis('off')
+                    axes[1].imshow(heatmap, cmap='jet')
+                    axes[1].set_title('Heatmap')
+                    axes[1].axis('off')
                     
-                    for i, (hm, name) in enumerate(zip(heatmaps, layer_names)):
-                        axes[0, i+1].imshow(hm, cmap='jet')
-                        axes[0, i+1].set_title(name[:12])
-                        axes[0, i+1].axis('off')
+                    axes[2].imshow(overlay)
+                    axes[2].set_title('Overlay')
+                    axes[2].axis('off')
                     
-                    axes[1, 0].imshow(img_display)
-                    axes[1, 0].set_title('Original')
-                    axes[1, 0].axis('off')
-                    
-                    for i, (hm, name) in enumerate(zip(heatmaps, layer_names)):
-                        overlay_hm = overlay_heatmap_jet(img_display, hm, alpha)
-                        axes[1, i+1].imshow(overlay_hm)
-                        axes[1, i+1].set_title(name[:12])
-                        axes[1, i+1].axis('off')
-                    
-                    plt.suptitle(f'Layer-wise Grad-CAM - Target: {target_label}', fontsize=16)
+                    plt.suptitle(f'Layer-wise Grad-CAM - {emotion}', fontsize=14)
                     plt.tight_layout()
                     
                     buf = io.BytesIO()
@@ -557,17 +457,18 @@ def main():
                     buf.seek(0)
                     
                     st.download_button(
-                        label="📥 Download Layer-wise Grad-CAM",
+                        label="📥 Download Explanation",
                         data=buf.getvalue(),
-                        file_name=f"layerwise_gradcam_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                        mime="image/png"
+                        file_name=f"explanation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                        mime="image/png",
+                        use_container_width=True
                     )
                     plt.close()
                     
                 except Exception as e:
-                    st.error(f"Error generating XAI: {e}")
-                    import traceback
-                    st.code(traceback.format_exc())
+                    st.error(f"Error generating explanation: {e}")
+        else:
+            st.info("Upload an image and click 'Predict' to see the explanation.")
 
 # ============================================================================
 # RUN APP
