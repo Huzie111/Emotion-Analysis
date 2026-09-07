@@ -254,7 +254,7 @@ def tokenize_text(text, word_to_idx, max_len=100):
             token_ids = token_ids[:max_len]
         else:
             token_ids = token_ids + [0] * (max_len - len(token_ids))
-        return torch.tensor(token_ids).unsqueeze(0)
+        return torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
     
     tokens = text.lower().split()
     token_ids = []
@@ -266,7 +266,7 @@ def tokenize_text(text, word_to_idx, max_len=100):
     else:
         token_ids = token_ids + [0] * (max_len - len(token_ids))
     
-    return torch.tensor(token_ids).unsqueeze(0)
+    return torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
 
 def predict(model, image, text_tensor, device):
     with torch.no_grad():
@@ -276,7 +276,7 @@ def predict(model, image, text_tensor, device):
         probabilities = torch.softmax(outputs, dim=1)
         prediction = torch.argmax(probabilities, dim=1).item()
         confidence = probabilities[0][prediction].item()
-    return prediction, confidence, probabilities.cpu().numpy()
+    return prediction, confidence, probabilities
 
 # ============================================================================
 # STREAMLIT UI
@@ -513,30 +513,31 @@ with col2:
                     
                     class_names = ['Happy', 'Sad']
                     predicted_class = class_names[prediction]
-                    confidence_percent = float(confidence * 100)
                     
-                    # Display result with proper formatting
+                    # Convert to Python float safely
+                    confidence_pct = confidence * 100
+                    happy_pct = probabilities[0][0].item() * 100
+                    sad_pct = probabilities[0][1].item() * 100
+                    
+                    # Display result
                     if predicted_class == 'Happy':
                         st.markdown(f"""
                         <div class="result-box happy">
                             <h1 style="font-size: 3rem;">Happy</h1>
-                            <p style="font-size: 1.2rem;">Confidence: {confidence_percent:.1f}%</p>
+                            <p style="font-size: 1.2rem;">Confidence: {confidence_pct:.1f}%</p>
                         </div>
                         """, unsafe_allow_html=True)
                     else:
                         st.markdown(f"""
                         <div class="result-box sad">
                             <h1 style="font-size: 3rem;">Sad</h1>
-                            <p style="font-size: 1.2rem;">Confidence: {confidence_percent:.1f}%</p>
+                            <p style="font-size: 1.2rem;">Confidence: {confidence_pct:.1f}%</p>
                         </div>
                         """, unsafe_allow_html=True)
                     
                     # Confidence bars
                     st.markdown("#### Confidence Distribution")
                     col1_bar, col2_bar = st.columns(2)
-                    
-                    happy_pct = float(probabilities[0] * 100)
-                    sad_pct = float(probabilities[1] * 100)
                     
                     with col1_bar:
                         st.write("Happy")
@@ -560,7 +561,7 @@ with col2:
                         </div>
                         """, unsafe_allow_html=True)
                     
-                    if confidence_percent < 85:
+                    if confidence_pct < 85:
                         st.warning("Low confidence (< 85%). Manual review recommended.")
                     else:
                         st.success("High confidence prediction.")
@@ -573,7 +574,7 @@ with col2:
                     with col_m1:
                         st.markdown(f"""
                         <div class="metric-card">
-                            <div class="metric-value">{confidence_percent:.1f}%</div>
+                            <div class="metric-value">{confidence_pct:.1f}%</div>
                             <div class="metric-label">Confidence</div>
                         </div>
                         """, unsafe_allow_html=True)
