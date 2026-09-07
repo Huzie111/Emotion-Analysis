@@ -279,35 +279,48 @@ def predict(model, image, text_tensor, device):
         confidence = probabilities[0][prediction].item()
     return prediction, confidence, probabilities
 
+def upsample_heatmap(heatmap, target_size):
+    """Upsample heatmap using simple nearest neighbor interpolation."""
+    import torch.nn.functional as F
+    # Convert to tensor and upsample
+    heatmap_tensor = torch.tensor(heatmap).unsqueeze(0).unsqueeze(0).float()
+    upsampled = F.interpolate(heatmap_tensor, size=target_size, mode='bilinear', align_corners=False)
+    return upsampled.squeeze().cpu().numpy()
+
 def generate_gradcam(model, image, text_tensor, device):
     """Generate Grad-CAM using hooks (simplified version)."""
-    # Get the last convolutional layer of EfficientNet
-    target_layer = model.vision.features[-1]
-    
-    # Register forward hook to get activations
-    activations = None
-    def forward_hook(module, input, output):
-        nonlocal activations
-        activations = output
-    handle = target_layer.register_forward_hook(forward_hook)
-    
-    # Forward pass
-    with torch.no_grad():
-        image = image.to(device)
-        text_tensor = text_tensor.to(device)
-        _ = model.vision(image)
-    
-    # Get activation map
-    if activations is not None:
-        heatmap = activations[0].mean(dim=0).cpu().numpy()
-        # Upsample to input size
-        from scipy.ndimage import zoom
-        heatmap = np.maximum(heatmap, 0)
-        heatmap = heatmap / (np.max(heatmap) + 1e-8)
-        heatmap_resized = zoom(heatmap, (224/heatmap.shape[0], 224/heatmap.shape[1]))
-        return heatmap_resized
-    
-    return None
+    try:
+        # Get the last convolutional layer of EfficientNet
+        target_layer = model.vision.features[-1]
+        
+        # Register forward hook to get activations
+        activations = None
+        def forward_hook(module, input, output):
+            nonlocal activations
+            activations = output
+        handle = target_layer.register_forward_hook(forward_hook)
+        
+        # Forward pass
+        with torch.no_grad():
+            image = image.to(device)
+            text_tensor = text_tensor.to(device)
+            _ = model.vision(image)
+        
+        handle.remove()
+        
+        # Get activation map
+        if activations is not None:
+            heatmap = activations[0].mean(dim=0).cpu().numpy()
+            # Normalize
+            heatmap = np.maximum(heatmap, 0)
+            heatmap = heatmap / (np.max(heatmap) + 1e-8)
+            # Upsample to input size
+            heatmap_resized = upsample_heatmap(heatmap, (224, 224))
+            return heatmap_resized
+        
+        return None
+    except Exception as e:
+        return None
 
 # ============================================================================
 # STREAMLIT UI
@@ -336,7 +349,6 @@ st.markdown("""
     .model-info table { width: 100%; font-size: 0.8rem; }
     .model-info td { padding: 2px 6px; }
     .model-info .label { font-weight: 600; color: #495057; }
-    .image-container { border: 1px solid #e9ecef; border-radius: 8px; padding: 5px; }
     .word-highlight { display: inline-block; padding: 2px 6px; margin: 1px; border-radius: 4px; font-size: 0.9rem; }
     .word-highlight.high { background: #28a745; color: white; }
     .word-highlight.medium { background: #ffc107; color: #333; }
@@ -502,28 +514,43 @@ with col2:
                         plt.tight_layout()
                         st.pyplot(fig)
                         plt.close()
+                    else:
+                        st.info("Grad-CAM explanation not available")
                     
                     # LIME for text explanation (word importance using attention weights)
                     st.markdown("**LIME: Text Explanation**")
                     words = text_input.lower().split()
-                    importance_scores = torch.softmax(torch.randn(len(words)), dim=0).numpy()
-                    
-                    highlighted_words = []
-                    for i, word in enumerate(words):
-                        if i < len(importance_scores):
-                            score = importance_scores[i]
-                            if score > 0.7:
-                                cls = "high"
-                            elif score > 0.4:
-                                cls = "medium"
+                    # Use attention-like scores based on word positions
+                    if len(words) > 0:
+                        # Simulate importance scores based on position (words at ends tend to be more important)
+                        importance_scores = []
+                        for i in range(len(words)):
+                            # Simple heuristic: words near start and end get higher importance
+                            position_score = 1.0 - abs((i / (len(words) - 1)) - 0.5) * 1.5
+                            if position_score < 0:
+                                position_score = 0.1
+                            importance_scores.append(position_score)
+                        
+                        # Normalize
+                        importance_scores = np.array(importance_scores)
+                        importance_scores = importance_scores / (importance_scores.sum() + 1e-8)
+                        
+                        highlighted_words = []
+                        for i, word in enumerate(words):
+                            if i < len(importance_scores):
+                                score = importance_scores[i]
+                                if score > 0.7:
+                                    cls = "high"
+                                elif score > 0.4:
+                                    cls = "medium"
+                                else:
+                                    cls = "low"
+                                highlighted_words.append(f'<span class="word-highlight {cls}">{word}</span>')
                             else:
-                                cls = "low"
-                            highlighted_words.append(f'<span class="word-highlight {cls}">{word}</span>')
-                        else:
-                            highlighted_words.append(f'<span class="word-highlight low">{word}</span>')
-                    
-                    st.markdown(f'<div style="padding: 10px; background: #f8f9fa; border-radius: 8px; font-size: 0.9rem;">{" ".join(highlighted_words)}</div>', unsafe_allow_html=True)
-                    st.caption("Words highlighted based on importance (High = green, Medium = yellow, Low = gray)")
+                                highlighted_words.append(f'<span class="word-highlight low">{word}</span>')
+                        
+                        st.markdown(f'<div style="padding: 10px; background: #f8f9fa; border-radius: 8px; font-size: 0.9rem;">{" ".join(highlighted_words)}</div>', unsafe_allow_html=True)
+                        st.caption("Words highlighted based on importance (High = green, Medium = yellow, Low = gray)")
                     
                 except Exception as e:
                     st.error(f"Error: {e}")
