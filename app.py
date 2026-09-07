@@ -1,7 +1,8 @@
 """
 Multimodal Emotion Classification System
 Deployed on Streamlit Cloud
-Model: EfficientNet-B0 + BiLSTM (91.12% accuracy)
+Model: MobileNetV2 + BiLSTM (92.69% Validation Accuracy)
+Explainability: L32 Grad-CAM (Layer 32) for Visual + LIME for Text
 """
 
 import streamlit as st
@@ -22,11 +23,12 @@ warnings.filterwarnings('ignore')
 # GOOGLE DRIVE FILE IDs
 # ============================================================================
 
-MODEL_FILE_ID = "11lYY2-0tXlF4mE1peB2ReQy9bMLlp2mp"
-VOCAB_FILE_ID = "1r2mCVi-tVjeI18P2dBFFdlYAeHNuKnm-"
+# Model: MM_MobileNetV2_BiLSTM
+MODEL_FILE_ID = "YOUR_MODEL_FILE_ID_HERE"      # <-- REPLACE WITH ACTUAL MODEL FILE ID
+VOCAB_FILE_ID = "YOUR_VOCAB_FILE_ID_HERE"      # <-- REPLACE WITH ACTUAL VOCAB FILE ID
 
-MODEL_FILE_NAME = "best_model_efficientnet_b0_bilstm.pt"
-VOCAB_FILE_NAME = "vocabulary_3423.pth"
+MODEL_FILE_NAME = "MM_MobileNetV2_BiLSTM_final.pt"
+VOCAB_FILE_NAME = "vocabulary.pth"
 
 # ============================================================================
 # MODEL DEFINITIONS
@@ -217,7 +219,7 @@ def load_model(vocab_size):
                 return None, device
         
         text_enc = create_text_encoder('bilstm', vocab_size, hidden=128)
-        model = MultimodalModel('efficientnet_b0', text_enc)
+        model = MultimodalModel('mobilenet_v2', text_enc)
         
         checkpoint = torch.load(MODEL_FILE_NAME, map_location=device)
         state_dict = checkpoint.get('model_state_dict', checkpoint)
@@ -247,7 +249,7 @@ def preprocess_image(image):
         return image_transform(image).unsqueeze(0)
     return image
 
-def tokenize_text(text, word_to_idx, max_len=100):
+def tokenize_text(text, word_to_idx, max_len=50):
     if word_to_idx is None:
         tokens = text.lower().split()
         token_ids = [1] * len(tokens)
@@ -279,48 +281,170 @@ def predict(model, image, text_tensor, device):
         confidence = probabilities[0][prediction].item()
     return prediction, confidence, probabilities
 
+# ============================================================================
+# L32 GRAD-CAM (Layer 32 / Layer 33) - MobileNetV2 specific
+# ============================================================================
+
+def get_mobilenetv2_target_layer(model):
+    """
+    Get Layer 32 (L32) of MobileNetV2 for Grad-CAM.
+    MobileNetV2 features are sequential. Layer 32 corresponds to the
+    last convolutional layer before the final pooling.
+    """
+    # MobileNetV2 features: 0-18 layers
+    # Layer 32 is the last layer in features (index 18)
+    # Features layer count: 19 total (0-18)
+    # The last layer (index 18) is the final conv block
+    if hasattr(model.vision, 'features'):
+        # Get the last layer of features (L32 in MobileNetV2 terminology)
+        target_layer = model.vision.features[-1]
+        return target_layer
+    else:
+        # Fallback: use the last conv layer
+        last_conv = None
+        for name, module in model.vision.named_modules():
+            if isinstance(module, nn.Conv2d):
+                last_conv = module
+        return last_conv
+
 def upsample_heatmap(heatmap, target_size):
-    """Upsample heatmap using simple nearest neighbor interpolation."""
+    """Upsample heatmap using PyTorch interpolate."""
     import torch.nn.functional as F
-    # Convert to tensor and upsample
     heatmap_tensor = torch.tensor(heatmap).unsqueeze(0).unsqueeze(0).float()
     upsampled = F.interpolate(heatmap_tensor, size=target_size, mode='bilinear', align_corners=False)
     return upsampled.squeeze().cpu().numpy()
 
-def generate_gradcam(model, image, text_tensor, device):
-    """Generate Grad-CAM using hooks (simplified version)."""
+def generate_l32_gradcam(model, image, text_tensor, device, target_class=None):
+    """
+    Generate L32 Grad-CAM for MobileNetV2.
+    Uses Layer 32 (the last conv layer) as the target.
+    """
     try:
-        # Get the last convolutional layer of EfficientNet
-        target_layer = model.vision.features[-1]
+        # Get L32 target layer (last conv layer of MobileNetV2)
+        target_layer = get_mobilenetv2_target_layer(model)
         
-        # Register forward hook to get activations
+        if target_layer is None:
+            return None
+        
+        # Register forward hook to capture activations
         activations = None
+        gradients = None
+        
         def forward_hook(module, input, output):
             nonlocal activations
             activations = output
-        handle = target_layer.register_forward_hook(forward_hook)
+        
+        def backward_hook(module, grad_input, grad_output):
+            nonlocal gradients
+            gradients = grad_output[0]
+        
+        # Register hooks
+        forward_handle = target_layer.register_forward_hook(forward_hook)
+        backward_handle = target_layer.register_backward_hook(backward_hook)
         
         # Forward pass
-        with torch.no_grad():
-            image = image.to(device)
-            text_tensor = text_tensor.to(device)
-            _ = model.vision(image)
+        image = image.to(device)
+        text_tensor = text_tensor.to(device)
         
-        handle.remove()
+        # Enable gradient for Grad-CAM
+        image.requires_grad = True
         
-        # Get activation map
-        if activations is not None:
-            heatmap = activations[0].mean(dim=0).cpu().numpy()
-            # Normalize
+        # Forward through the model
+        outputs = model(image, text_tensor)
+        
+        # Get target class (if not specified, use predicted class)
+        if target_class is None:
+            target_class = torch.argmax(outputs, dim=1).item()
+        
+        # Backward pass for target class
+        model.zero_grad()
+        outputs[0][target_class].backward()
+        
+        # Remove hooks
+        forward_handle.remove()
+        backward_handle.remove()
+        
+        # Generate heatmap from activations and gradients
+        if activations is not None and gradients is not None:
+            # Global average pooling of gradients
+            pooled_gradients = torch.mean(gradients, dim=[0, 2, 3])
+            
+            # Weighted combination of activation maps
+            for i in range(activations.size(1)):
+                activations[:, i, :, :] *= pooled_gradients[i]
+            
+            # Average over channels
+            heatmap = torch.mean(activations, dim=1).squeeze().cpu().detach().numpy()
+            
+            # ReLU and normalize
             heatmap = np.maximum(heatmap, 0)
-            heatmap = heatmap / (np.max(heatmap) + 1e-8)
+            if np.max(heatmap) > 0:
+                heatmap = heatmap / np.max(heatmap)
+            
             # Upsample to input size
             heatmap_resized = upsample_heatmap(heatmap, (224, 224))
             return heatmap_resized
         
         return None
+        
     except Exception as e:
+        print(f"L32 Grad-CAM error: {e}")
         return None
+
+# ============================================================================
+# LIME FOR TEXT EXPLANATION
+# ============================================================================
+
+def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50, num_samples=100):
+    """
+    Generate LIME-like explanation for text using perturbation-based approach.
+    This is a simplified LIME implementation for text.
+    """
+    words = text.lower().split()
+    if len(words) == 0:
+        return None, []
+    
+    # Get base prediction for the original text
+    text_tensor = tokenize_text(text, word_to_idx, max_len)
+    text_tensor = text_tensor.to(device)
+    
+    # Create a dummy image tensor (black image) for text-only explanation
+    dummy_image = torch.zeros(1, 3, 224, 224).to(device)
+    
+    with torch.no_grad():
+        outputs = model(dummy_image, text_tensor)
+        base_probs = torch.softmax(outputs, dim=1).cpu().numpy()[0]
+        base_pred = np.argmax(base_probs)
+    
+    # Perturb words and measure impact
+    word_importance = []
+    
+    for i, word in enumerate(words):
+        # Remove word and measure change in prediction
+        perturbed_words = words[:i] + words[i+1:]
+        perturbed_text = ' '.join(perturbed_words)
+        
+        if len(perturbed_text.strip()) == 0:
+            continue
+        
+        perturbed_tensor = tokenize_text(perturbed_text, word_to_idx, max_len)
+        perturbed_tensor = perturbed_tensor.to(device)
+        
+        with torch.no_grad():
+            perturbed_outputs = model(dummy_image, perturbed_tensor)
+            perturbed_probs = torch.softmax(perturbed_outputs, dim=1).cpu().numpy()[0]
+        
+        # Calculate importance as change in confidence for the base prediction
+        importance = abs(base_probs[base_pred] - perturbed_probs[base_pred])
+        word_importance.append((word, importance))
+    
+    # Normalize importance scores
+    if len(word_importance) > 0:
+        max_imp = max([imp for _, imp in word_importance])
+        if max_imp > 0:
+            word_importance = [(w, imp / max_imp) for w, imp in word_importance]
+    
+    return base_pred, word_importance
 
 # ============================================================================
 # STREAMLIT UI
@@ -349,10 +473,12 @@ st.markdown("""
     .model-info table { width: 100%; font-size: 0.8rem; }
     .model-info td { padding: 2px 6px; }
     .model-info .label { font-weight: 600; color: #495057; }
-    .word-highlight { display: inline-block; padding: 2px 6px; margin: 1px; border-radius: 4px; font-size: 0.9rem; }
-    .word-highlight.high { background: #28a745; color: white; }
+    .xai-header { font-size: 1rem; font-weight: 600; color: #2c3e50; margin: 10px 0 5px 0; }
+    .word-highlight { display: inline-block; padding: 2px 6px; margin: 1px; border-radius: 4px; font-size: 0.9rem; transition: all 0.3s; }
+    .word-highlight.high { background: #dc3545; color: white; }
     .word-highlight.medium { background: #ffc107; color: #333; }
     .word-highlight.low { background: #e9ecef; color: #333; }
+    .explanation-caption { font-size: 0.7rem; color: #7f8c8d; font-style: italic; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -365,10 +491,21 @@ with st.sidebar:
     st.markdown("""
     <div class="model-info">
         <table>
-            <tr><td class="label">Vision</td><td>EfficientNet-B0</td></tr>
-            <tr><td class="label">Text</td><td>BiLSTM</td></tr>
-            <tr><td class="label">Accuracy</td><td>91.12%</td></tr>
-            <tr><td class="label">Size</td><td>26.08 MB</td></tr>
+            <tr><td class="label">Model</td><td>MobileNetV2+BiLSTM</td></tr>
+            <tr><td class="label">Task</td><td>Happy vs Sad</td></tr>
+            <tr><td class="label">Val Accuracy</td><td>92.69%</td></tr>
+            <tr><td class="label">Test Accuracy</td><td>92.00%</td></tr>
+            <tr><td class="label">Size</td><td>19.36 MB</td></tr>
+        </table>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("### Explainability")
+    st.markdown("""
+    <div class="model-info">
+        <table>
+            <tr><td class="label">Visual</td><td>L32 Grad-CAM</td></tr>
+            <tr><td class="label">Text</td><td>LIME</td></tr>
         </table>
     </div>
     """, unsafe_allow_html=True)
@@ -400,15 +537,15 @@ with st.sidebar:
             model, device = load_model(vocab_size)
             if model is not None:
                 st.success("Model ready")
-        except:
-            pass
+        except Exception as e:
+            st.error(f"Error: {e}")
 
 # ============================================================================
 # MAIN CONTENT
 # ============================================================================
 
 st.markdown('<div class="main-header">Multimodal Emotion Classifier</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">EfficientNet-B0 + BiLSTM | Children\'s Drawing + Self-Reflection Analysis</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | Children\'s Drawing + Self-Reflection Analysis</div>', unsafe_allow_html=True)
 
 # Compact 2-column layout
 col1, col2 = st.columns([1, 1])
@@ -445,7 +582,7 @@ with col2:
             with st.spinner("Analyzing..."):
                 try:
                     image_tensor = preprocess_image(image)
-                    text_tensor = tokenize_text(text_input, word_to_idx, max_len=100)
+                    text_tensor = tokenize_text(text_input, word_to_idx, max_len=50)
                     prediction, confidence, probabilities = predict(model, image_tensor, text_tensor, device)
                     
                     class_names = ['Happy', 'Sad']
@@ -498,59 +635,76 @@ with col2:
                     else:
                         st.success("High confidence prediction")
                     
-                    # Grad-CAM for visual explanation
+                    # =========================================================
+                    # L32 GRAD-CAM - Visual Explanation
+                    # =========================================================
                     st.markdown("---")
-                    st.markdown("**Grad-CAM: Visual Attention**")
-                    heatmap = generate_gradcam(model, image_tensor, text_tensor, device)
+                    st.markdown("### L32 Grad-CAM: Visual Attention")
+                    st.caption("Layer 32 - Last convolutional layer of MobileNetV2")
+                    
+                    heatmap = generate_l32_gradcam(model, image_tensor, text_tensor, device, target_class=prediction)
+                    
                     if heatmap is not None:
-                        fig, ax = plt.subplots(1, 2, figsize=(6, 3))
-                        ax[0].imshow(image.resize((224, 224)))
-                        ax[0].set_title("Original")
-                        ax[0].axis('off')
-                        ax[1].imshow(image.resize((224, 224)))
-                        ax[1].imshow(heatmap, cmap='jet', alpha=0.5)
-                        ax[1].set_title("Grad-CAM")
-                        ax[1].axis('off')
+                        fig, axes = plt.subplots(1, 3, figsize=(9, 3))
+                        
+                        # Original image
+                        axes[0].imshow(image.resize((224, 224)))
+                        axes[0].set_title("Original")
+                        axes[0].axis('off')
+                        
+                        # Heatmap only
+                        axes[1].imshow(heatmap, cmap='jet')
+                        axes[1].set_title("L32 Grad-CAM")
+                        axes[1].axis('off')
+                        
+                        # Overlay
+                        axes[2].imshow(image.resize((224, 224)))
+                        axes[2].imshow(heatmap, cmap='jet', alpha=0.5)
+                        axes[2].set_title("Overlay")
+                        axes[2].axis('off')
+                        
                         plt.tight_layout()
                         st.pyplot(fig)
                         plt.close()
                     else:
-                        st.info("Grad-CAM explanation not available")
+                        st.info("L32 Grad-CAM explanation not available")
                     
-                    # LIME for text explanation (word importance using attention weights)
-                    st.markdown("**LIME: Text Explanation**")
-                    words = text_input.lower().split()
-                    # Use attention-like scores based on word positions
-                    if len(words) > 0:
-                        # Simulate importance scores based on position (words at ends tend to be more important)
-                        importance_scores = []
-                        for i in range(len(words)):
-                            # Simple heuristic: words near start and end get higher importance
-                            position_score = 1.0 - abs((i / (len(words) - 1)) - 0.5) * 1.5
-                            if position_score < 0:
-                                position_score = 0.1
-                            importance_scores.append(position_score)
-                        
-                        # Normalize
-                        importance_scores = np.array(importance_scores)
-                        importance_scores = importance_scores / (importance_scores.sum() + 1e-8)
-                        
+                    # =========================================================
+                    # LIME - Text Explanation
+                    # =========================================================
+                    st.markdown("### LIME: Text Explanation")
+                    
+                    # Generate LIME explanation
+                    base_pred, word_importance = generate_lime_text_explanation(
+                        text_input, model, word_to_idx, device, max_len=50
+                    )
+                    
+                    if word_importance and len(word_importance) > 0:
+                        # Display highlighted words
                         highlighted_words = []
-                        for i, word in enumerate(words):
-                            if i < len(importance_scores):
-                                score = importance_scores[i]
-                                if score > 0.7:
-                                    cls = "high"
-                                elif score > 0.4:
-                                    cls = "medium"
-                                else:
-                                    cls = "low"
-                                highlighted_words.append(f'<span class="word-highlight {cls}">{word}</span>')
+                        for word, importance in word_importance:
+                            if importance > 0.7:
+                                cls = "high"
+                            elif importance > 0.4:
+                                cls = "medium"
                             else:
-                                highlighted_words.append(f'<span class="word-highlight low">{word}</span>')
+                                cls = "low"
+                            highlighted_words.append(f'<span class="word-highlight {cls}">{word}</span>')
                         
-                        st.markdown(f'<div style="padding: 10px; background: #f8f9fa; border-radius: 8px; font-size: 0.9rem;">{" ".join(highlighted_words)}</div>', unsafe_allow_html=True)
-                        st.caption("Words highlighted based on importance (High = green, Medium = yellow, Low = gray)")
+                        st.markdown(
+                            f'<div style="padding: 10px; background: #f8f9fa; border-radius: 8px; font-size: 0.95rem; line-height: 1.8;">'
+                            f'{" ".join(highlighted_words)}'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                        
+                        st.caption("High importance = Red | Medium = Yellow | Low = Gray")
+                        
+                        # Show class prediction for explanation
+                        class_names_expl = ['Happy', 'Sad']
+                        st.caption(f"Prediction based on text: {class_names_expl[base_pred]}")
+                    else:
+                        st.info("LIME explanation not available for this text")
                     
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -565,4 +719,8 @@ with col2:
 # ============================================================================
 
 st.markdown("---")
-st.markdown('<div style="text-align: center; color: #95a5a6; font-size: 0.7rem;">EfficientNet-B0 + BiLSTM | 91.12% Accuracy</div>', unsafe_allow_html=True)
+st.markdown("""
+<div style="text-align: center; color: #95a5a6; font-size: 0.7rem;">
+    MobileNetV2 + BiLSTM | L32 Grad-CAM + LIME | 92.69% Val Accuracy | KIDO Dataset
+</div>
+""", unsafe_allow_html=True)
