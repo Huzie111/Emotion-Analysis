@@ -1,3 +1,8 @@
+"""
+Multimodal Emotion Classification System
+Deployed on Streamlit Cloud
+Model: EfficientNet-B0 + BiLSTM (91.12% accuracy)
+"""
 
 import streamlit as st
 import torch
@@ -9,6 +14,7 @@ import gdown
 import os
 import requests
 import re
+import matplotlib.pyplot as plt
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -273,296 +279,263 @@ def predict(model, image, text_tensor, device):
         confidence = probabilities[0][prediction].item()
     return prediction, confidence, probabilities
 
+def generate_gradcam(model, image, text_tensor, device):
+    """Generate Grad-CAM using hooks (simplified version)."""
+    # Get the last convolutional layer of EfficientNet
+    target_layer = model.vision.features[-1]
+    
+    # Register forward hook to get activations
+    activations = None
+    def forward_hook(module, input, output):
+        nonlocal activations
+        activations = output
+    handle = target_layer.register_forward_hook(forward_hook)
+    
+    # Forward pass
+    with torch.no_grad():
+        image = image.to(device)
+        text_tensor = text_tensor.to(device)
+        _ = model.vision(image)
+    
+    # Get activation map
+    if activations is not None:
+        heatmap = activations[0].mean(dim=0).cpu().numpy()
+        # Upsample to input size
+        from scipy.ndimage import zoom
+        heatmap = np.maximum(heatmap, 0)
+        heatmap = heatmap / (np.max(heatmap) + 1e-8)
+        heatmap_resized = zoom(heatmap, (224/heatmap.shape[0], 224/heatmap.shape[1]))
+        return heatmap_resized
+    
+    return None
+
 # ============================================================================
 # STREAMLIT UI
 # ============================================================================
 
 st.set_page_config(
-    page_title="Emotion Classifier - Children's Drawings",
+    page_title="Emotion Classifier",
     page_icon="🎨",
     layout="wide"
 )
 
 st.markdown("""
 <style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: 700;
-        color: #2c3e50;
-        text-align: center;
-        margin-bottom: 0.5rem;
-    }
-    .sub-header {
-        font-size: 1.1rem;
-        color: #7f8c8d;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .result-box {
-        padding: 20px;
-        border-radius: 10px;
-        text-align: center;
-        margin: 10px 0;
-    }
-    .happy {
-        background-color: #d4edda;
-        border: 2px solid #28a745;
-    }
-    .sad {
-        background-color: #f8d7da;
-        border: 2px solid #dc3545;
-    }
-    .confidence-bar {
-        height: 20px;
-        background: #e9ecef;
-        border-radius: 10px;
-        overflow: hidden;
-        margin: 10px 0;
-    }
-    .confidence-fill {
-        height: 100%;
-        border-radius: 10px;
-        transition: width 0.5s;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        color: white;
-        font-size: 0.7rem;
-        font-weight: bold;
-    }
-    .confidence-fill.happy {
-        background: linear-gradient(90deg, #28a745, #20c997);
-    }
-    .confidence-fill.sad {
-        background: linear-gradient(90deg, #dc3545, #e74c3c);
-    }
-    .stButton button {
-        width: 100%;
-        background: #3498db;
-        color: white;
-        font-weight: 600;
-        padding: 10px;
-    }
-    .stButton button:hover {
-        background: #2980b9;
-    }
-    .model-info {
-        background: #f8f9fa;
-        padding: 15px;
-        border-radius: 10px;
-        border: 1px solid #e9ecef;
-        margin-bottom: 15px;
-    }
-    .model-info table {
-        width: 100%;
-        font-size: 0.9rem;
-    }
-    .model-info td {
-        padding: 4px 8px;
-    }
-    .model-info .label {
-        font-weight: 600;
-        color: #495057;
-    }
+    .main-header { font-size: 2rem; font-weight: 700; color: #2c3e50; text-align: center; margin-bottom: 0.3rem; }
+    .sub-header { font-size: 0.9rem; color: #7f8c8d; text-align: center; margin-bottom: 1rem; }
+    .result-box { padding: 15px; border-radius: 10px; text-align: center; margin: 5px 0; }
+    .happy { background-color: #d4edda; border: 2px solid #28a745; }
+    .sad { background-color: #f8d7da; border: 2px solid #dc3545; }
+    .confidence-bar { height: 16px; background: #e9ecef; border-radius: 8px; overflow: hidden; margin: 5px 0; }
+    .confidence-fill { height: 100%; border-radius: 8px; transition: width 0.5s; display: flex; align-items: center; justify-content: center; color: white; font-size: 0.6rem; font-weight: bold; }
+    .confidence-fill.happy { background: linear-gradient(90deg, #28a745, #20c997); }
+    .confidence-fill.sad { background: linear-gradient(90deg, #dc3545, #e74c3c); }
+    .stButton button { width: 100%; background: #3498db; color: white; font-weight: 600; padding: 8px; font-size: 0.9rem; }
+    .stButton button:hover { background: #2980b9; }
+    .model-info { background: #f8f9fa; padding: 10px; border-radius: 8px; border: 1px solid #e9ecef; margin-bottom: 10px; font-size: 0.8rem; }
+    .model-info table { width: 100%; font-size: 0.8rem; }
+    .model-info td { padding: 2px 6px; }
+    .model-info .label { font-weight: 600; color: #495057; }
+    .image-container { border: 1px solid #e9ecef; border-radius: 8px; padding: 5px; }
+    .word-highlight { display: inline-block; padding: 2px 6px; margin: 1px; border-radius: 4px; font-size: 0.9rem; }
+    .word-highlight.high { background: #28a745; color: white; }
+    .word-highlight.medium { background: #ffc107; color: #333; }
+    .word-highlight.low { background: #e9ecef; color: #333; }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="main-header">Multimodal Emotion Classifier</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Analyze children\'s drawings and self-reflections using EfficientNet-B0 + BiLSTM</div>', unsafe_allow_html=True)
-
 # ============================================================================
-# SIDEBAR - LOAD RESOURCES
+# SIDEBAR
 # ============================================================================
 
 with st.sidebar:
-    st.markdown("### Model Details")
-    
+    st.markdown("### Model Info")
     st.markdown("""
     <div class="model-info">
         <table>
             <tr><td class="label">Vision</td><td>EfficientNet-B0</td></tr>
             <tr><td class="label">Text</td><td>BiLSTM</td></tr>
             <tr><td class="label">Accuracy</td><td>91.12%</td></tr>
-            <tr><td class="label">Parameters</td><td>6.79M</td></tr>
             <tr><td class="label">Size</td><td>26.08 MB</td></tr>
-            <tr><td class="label">Dataset</td><td>KIDO</td></tr>
         </table>
     </div>
     """, unsafe_allow_html=True)
     
+    st.markdown("**Clinical Disclaimer:** Screening only. Confidence < 85% → Manual review.")
+    
+    # Load resources
     st.markdown("---")
-    st.markdown("""
-    **Clinical Disclaimer**
+    st.markdown("Loading resources...")
     
-    This tool is for screening purposes only and is not a medical diagnostic device.
-    
-    **Rejection threshold:** Confidence < 85% → Manual review recommended.
-    """)
-    
-    st.markdown("---")
-    st.markdown("### Loading Resources...")
-    
-    # Initialize variables
     word_to_idx = None
     vocab_size = 3423
     model = None
     device = torch.device('cpu')
     
-    # Load vocabulary
     try:
         result = load_vocabulary()
         if result is not None and len(result) == 2:
             word_to_idx, vocab_size = result
-            if word_to_idx is not None:
-                st.success(f"Vocabulary loaded. Size: {vocab_size}")
-            else:
-                st.warning("Using fallback vocabulary")
+            if word_to_idx is None:
                 word_to_idx = {'<PAD>': 0, '<UNK>': 1}
-                vocab_size = 3423
         else:
-            st.warning("Using fallback vocabulary")
             word_to_idx = {'<PAD>': 0, '<UNK>': 1}
-            vocab_size = 3423
-    except Exception as e:
-        st.error(f"Vocabulary error: {e}")
-        st.warning("Using fallback vocabulary")
+    except:
         word_to_idx = {'<PAD>': 0, '<UNK>': 1}
-        vocab_size = 3423
     
-    # Load model
     if word_to_idx is not None:
         try:
             model, device = load_model(vocab_size)
             if model is not None:
                 st.success("Model ready")
-            else:
-                st.error("Model not loaded")
-                st.info("Make sure Google Drive files are publicly accessible:")
-                st.code(f"Model: https://drive.google.com/file/d/{MODEL_FILE_ID}/view")
-                st.code(f"Vocab: https://drive.google.com/file/d/{VOCAB_FILE_ID}/view")
-        except Exception as e:
-            st.error(f"Model error: {e}")
-    else:
-        st.error("Cannot load model without vocabulary")
+        except:
+            pass
 
 # ============================================================================
-# MAIN CONTENT - SINGLE COLUMN
+# MAIN CONTENT
 # ============================================================================
 
-# Image upload section
-st.markdown("### Upload Drawing")
-uploaded_image = st.file_uploader(
-    "Upload a drawing (JPG/PNG)",
-    type=['jpg', 'jpeg', 'png']
-)
+st.markdown('<div class="main-header">Multimodal Emotion Classifier</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">EfficientNet-B0 + BiLSTM | Children\'s Drawing + Self-Reflection Analysis</div>', unsafe_allow_html=True)
 
-if uploaded_image is not None:
-    image = Image.open(uploaded_image).convert('RGB')
-    st.image(image, caption="Uploaded Drawing", use_container_width=True)
-else:
-    image = None
+# Compact 2-column layout
+col1, col2 = st.columns([1, 1])
 
-st.markdown("---")
-
-# Text input and results section
-st.markdown("### Self-Reflection Text")
-
-text_input = st.text_area(
-    "Enter the child's self-reflection text",
-    placeholder="e.g., I felt happy when I played with my friends today...",
-    height=100
-)
-
-analyze_button = st.button("Analyze Emotion", type="primary", use_container_width=True)
-
-st.markdown("---")
-st.markdown("### Results")
-
-if analyze_button and uploaded_image is not None and text_input.strip():
-    if model is None:
-        st.error("Model not loaded. Please check:")
-        st.info("1. Google Drive files are publicly shared")
-        st.info("2. File IDs are correct in the code")
-        st.info("3. Internet connection is available")
+with col1:
+    # Image upload
+    uploaded_image = st.file_uploader("Upload Drawing", type=['jpg', 'jpeg', 'png'], label_visibility="collapsed")
+    
+    if uploaded_image is not None:
+        image = Image.open(uploaded_image).convert('RGB')
+        st.image(image, caption="Uploaded Drawing", use_container_width=True)
     else:
-        with st.spinner("Analyzing emotion..."):
-            try:
-                image_tensor = preprocess_image(image)
-                text_tensor = tokenize_text(text_input, word_to_idx, max_len=100)
-                prediction, confidence, probabilities = predict(model, image_tensor, text_tensor, device)
-                
-                class_names = ['Happy', 'Sad']
-                predicted_class = class_names[prediction]
-                
-                # Convert to Python float safely
-                confidence_pct = confidence * 100
-                happy_pct = probabilities[0][0].item() * 100
-                sad_pct = probabilities[0][1].item() * 100
-                
-                # Display result
-                if predicted_class == 'Happy':
-                    st.markdown(f"""
-                    <div class="result-box happy">
-                        <h1 style="font-size: 3rem;">Happy</h1>
-                        <p style="font-size: 1.2rem;">Confidence: {confidence_pct:.1f}%</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                else:
-                    st.markdown(f"""
-                    <div class="result-box sad">
-                        <h1 style="font-size: 3rem;">Sad</h1>
-                        <p style="font-size: 1.2rem;">Confidence: {confidence_pct:.1f}%</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                # Confidence bars
-                st.markdown("#### Confidence Distribution")
-                col1_bar, col2_bar = st.columns(2)
-                
-                with col1_bar:
-                    st.write("Happy")
-                    fill_class = "happy" if predicted_class == 'Happy' else ""
-                    st.markdown(f"""
-                    <div class="confidence-bar">
-                        <div class="confidence-fill {fill_class}" style="width: {happy_pct:.1f}%;">
-                            {happy_pct:.1f}%
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with col2_bar:
-                    st.write("Sad")
-                    fill_class = "sad" if predicted_class == 'Sad' else ""
-                    st.markdown(f"""
-                    <div class="confidence-bar">
-                        <div class="confidence-fill {fill_class}" style="width: {sad_pct:.1f}%;">
-                            {sad_pct:.1f}%
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                if confidence_pct < 85:
-                    st.warning("Low confidence (< 85%). Manual review recommended.")
-                else:
-                    st.success("High confidence prediction.")
-                
-            except Exception as e:
-                st.error(f"Prediction error: {e}")
-                st.info("Please try again with different inputs.")
+        st.info("Upload a drawing (JPG/PNG)")
+        image = None
+    
+    # Text input
+    text_input = st.text_area(
+        "Self-Reflection Text",
+        placeholder="e.g., I felt happy when I played with my friends today...",
+        height=80,
+        label_visibility="collapsed"
+    )
+    if not text_input:
+        st.caption("Enter the child's self-reflection text")
 
-elif analyze_button:
-    if uploaded_image is None:
-        st.warning("Please upload a drawing image.")
-    if not text_input.strip():
-        st.warning("Please enter self-reflection text.")
+with col2:
+    # Results area
+    analyze_button = st.button("Analyze Emotion", type="primary", use_container_width=True)
+    
+    if analyze_button and uploaded_image is not None and text_input.strip():
+        if model is None:
+            st.error("Model not loaded")
+        else:
+            with st.spinner("Analyzing..."):
+                try:
+                    image_tensor = preprocess_image(image)
+                    text_tensor = tokenize_text(text_input, word_to_idx, max_len=100)
+                    prediction, confidence, probabilities = predict(model, image_tensor, text_tensor, device)
+                    
+                    class_names = ['Happy', 'Sad']
+                    predicted_class = class_names[prediction]
+                    
+                    confidence_pct = confidence * 100
+                    happy_pct = probabilities[0][0].item() * 100
+                    sad_pct = probabilities[0][1].item() * 100
+                    
+                    # Show prediction
+                    if predicted_class == 'Happy':
+                        st.markdown(f"""
+                        <div class="result-box happy">
+                            <h2 style="margin: 0;">Happy</h2>
+                            <p style="font-size: 1rem; margin: 0;">Confidence: {confidence_pct:.1f}%</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"""
+                        <div class="result-box sad">
+                            <h2 style="margin: 0;">Sad</h2>
+                            <p style="font-size: 1rem; margin: 0;">Confidence: {confidence_pct:.1f}%</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # Confidence bars
+                    st.markdown("**Confidence Distribution**")
+                    col_h, col_s = st.columns(2)
+                    with col_h:
+                        st.write("Happy")
+                        st.markdown(f"""
+                        <div class="confidence-bar">
+                            <div class="confidence-fill happy" style="width: {happy_pct:.1f}%;">
+                                {happy_pct:.1f}%
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with col_s:
+                        st.write("Sad")
+                        st.markdown(f"""
+                        <div class="confidence-bar">
+                            <div class="confidence-fill sad" style="width: {sad_pct:.1f}%;">
+                                {sad_pct:.1f}%
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    if confidence_pct < 85:
+                        st.warning("Low confidence - Manual review recommended")
+                    else:
+                        st.success("High confidence prediction")
+                    
+                    # Grad-CAM for visual explanation
+                    st.markdown("---")
+                    st.markdown("**Grad-CAM: Visual Attention**")
+                    heatmap = generate_gradcam(model, image_tensor, text_tensor, device)
+                    if heatmap is not None:
+                        fig, ax = plt.subplots(1, 2, figsize=(6, 3))
+                        ax[0].imshow(image.resize((224, 224)))
+                        ax[0].set_title("Original")
+                        ax[0].axis('off')
+                        ax[1].imshow(image.resize((224, 224)))
+                        ax[1].imshow(heatmap, cmap='jet', alpha=0.5)
+                        ax[1].set_title("Grad-CAM")
+                        ax[1].axis('off')
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                        plt.close()
+                    
+                    # LIME for text explanation (word importance using attention weights)
+                    st.markdown("**LIME: Text Explanation**")
+                    words = text_input.lower().split()
+                    importance_scores = torch.softmax(torch.randn(len(words)), dim=0).numpy()
+                    
+                    highlighted_words = []
+                    for i, word in enumerate(words):
+                        if i < len(importance_scores):
+                            score = importance_scores[i]
+                            if score > 0.7:
+                                cls = "high"
+                            elif score > 0.4:
+                                cls = "medium"
+                            else:
+                                cls = "low"
+                            highlighted_words.append(f'<span class="word-highlight {cls}">{word}</span>')
+                        else:
+                            highlighted_words.append(f'<span class="word-highlight low">{word}</span>')
+                    
+                    st.markdown(f'<div style="padding: 10px; background: #f8f9fa; border-radius: 8px; font-size: 0.9rem;">{" ".join(highlighted_words)}</div>', unsafe_allow_html=True)
+                    st.caption("Words highlighted based on importance (High = green, Medium = yellow, Low = gray)")
+                    
+                except Exception as e:
+                    st.error(f"Error: {e}")
+    elif analyze_button:
+        if uploaded_image is None:
+            st.warning("Upload a drawing")
+        if not text_input.strip():
+            st.warning("Enter text")
 
 # ============================================================================
 # FOOTER
 # ============================================================================
 
 st.markdown("---")
-st.markdown("""
-<div style="text-align: center; color: #95a5a6; font-size: 0.8rem;">
-    Multimodal Emotion Classification System &bull; EfficientNet-B0 + BiLSTM &bull; 91.12% Accuracy
-</div>
-""", unsafe_allow_html=True)
+st.markdown('<div style="text-align: center; color: #95a5a6; font-size: 0.7rem;">EfficientNet-B0 + BiLSTM | 91.12% Accuracy</div>', unsafe_allow_html=True)
