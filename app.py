@@ -24,8 +24,8 @@ warnings.filterwarnings('ignore')
 # ============================================================================
 
 # Model: MM_MobileNetV2_BiLSTM
-MODEL_FILE_ID = "YOUR_MODEL_FILE_ID_HERE"      # <-- REPLACE WITH ACTUAL MODEL FILE ID
-VOCAB_FILE_ID = "YOUR_VOCAB_FILE_ID_HERE"      # <-- REPLACE WITH ACTUAL VOCAB FILE ID
+MODEL_FILE_ID = "11lYY2-0tXlF4mE1peB2ReQy9bMLlp2mp"      # <-- REPLACE WITH ACTUAL MODEL FILE ID
+VOCAB_FILE_ID = "1r2mCVi-tVjeI18P2dBFFdlYAeHNuKnm-"      # <-- REPLACE WITH ACTUAL VOCAB FILE ID
 
 MODEL_FILE_NAME = "MM_MobileNetV2_BiLSTM_final.pt"
 VOCAB_FILE_NAME = "vocabulary.pth"
