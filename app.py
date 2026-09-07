@@ -30,8 +30,8 @@ warnings.filterwarnings('ignore')
 MODEL_FILE_ID = "11lYY2-0tXlF4mE1peB2ReQy9bMLlp2mp"      # <-- REPLACE WITH YOUR ACTUAL MODEL FILE ID https://drive.google.com/file/d/1r2mCVi-tVjeI18P2dBFFdlYAeHNuKnm-/view?usp=drive_link
 VOCAB_FILE_ID = "1r2mCVi-tVjeI18P2dBFFdlYAeHNuKnm-"      # <-- REPLACE WITH YOUR ACTUAL VOCAB FILE ID https://drive.google.com/file/d/11lYY2-0tXlF4mE1peB2ReQy9bMLlp2mp/view?usp=drive_link
 
-MODEL_FILE_NAME = "best_model_efficientnet_b0_bilstm.pth"
-VOCAB_FILE_NAME = "vocabulary.pth"
+MODEL_FILE_NAME = "best_model_efficientnet_b0_bilstm.pt"
+VOCAB_FILE_NAME = "vocabulary_3423.pth"
 
 # ============================================================================
 # MODEL DEFINITIONS
