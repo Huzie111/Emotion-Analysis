@@ -1,8 +1,3 @@
-"""
-Multimodal Emotion Classification System
-Deployed on Streamlit Cloud
-Model: EfficientNet-B0 + BiLSTM (91.12% accuracy)
-"""
 
 import streamlit as st
 import torch
@@ -341,22 +336,6 @@ st.markdown("""
     .confidence-fill.sad {
         background: linear-gradient(90deg, #dc3545, #e74c3c);
     }
-    .metric-card {
-        background: #f8f9fa;
-        padding: 15px;
-        border-radius: 10px;
-        text-align: center;
-        border: 1px solid #e9ecef;
-    }
-    .metric-value {
-        font-size: 1.5rem;
-        font-weight: 700;
-        color: #2c3e50;
-    }
-    .metric-label {
-        font-size: 0.8rem;
-        color: #7f8c8d;
-    }
     .stButton button {
         width: 100%;
         background: #3498db;
@@ -467,143 +446,115 @@ with st.sidebar:
         st.error("Cannot load model without vocabulary")
 
 # ============================================================================
-# MAIN CONTENT - TWO COLUMNS
+# MAIN CONTENT - SINGLE COLUMN
 # ============================================================================
 
-col1, col2 = st.columns([1, 1])
+# Image upload section
+st.markdown("### Upload Drawing")
+uploaded_image = st.file_uploader(
+    "Upload a drawing (JPG/PNG)",
+    type=['jpg', 'jpeg', 'png']
+)
 
-with col1:
-    st.markdown("### Upload Inputs")
-    
-    uploaded_image = st.file_uploader(
-        "Upload a drawing (JPG/PNG)",
-        type=['jpg', 'jpeg', 'png']
-    )
-    
-    if uploaded_image is not None:
-        image = Image.open(uploaded_image).convert('RGB')
-        st.image(image, caption="Uploaded Drawing", use_container_width=True)
+if uploaded_image is not None:
+    image = Image.open(uploaded_image).convert('RGB')
+    st.image(image, caption="Uploaded Drawing", use_container_width=True)
+else:
+    image = None
+
+st.markdown("---")
+
+# Text input and results section
+st.markdown("### Self-Reflection Text")
+
+text_input = st.text_area(
+    "Enter the child's self-reflection text",
+    placeholder="e.g., I felt happy when I played with my friends today...",
+    height=100
+)
+
+analyze_button = st.button("Analyze Emotion", type="primary", use_container_width=True)
+
+st.markdown("---")
+st.markdown("### Results")
+
+if analyze_button and uploaded_image is not None and text_input.strip():
+    if model is None:
+        st.error("Model not loaded. Please check:")
+        st.info("1. Google Drive files are publicly shared")
+        st.info("2. File IDs are correct in the code")
+        st.info("3. Internet connection is available")
     else:
-        image = None
-    
-    st.markdown("---")
-    text_input = st.text_area(
-        "Enter self-reflection text",
-        placeholder="e.g., I felt happy when I played with my friends today...",
-        height=100
-    )
-    
-    analyze_button = st.button("Analyze Emotion", type="primary", use_container_width=True)
+        with st.spinner("Analyzing emotion..."):
+            try:
+                image_tensor = preprocess_image(image)
+                text_tensor = tokenize_text(text_input, word_to_idx, max_len=100)
+                prediction, confidence, probabilities = predict(model, image_tensor, text_tensor, device)
+                
+                class_names = ['Happy', 'Sad']
+                predicted_class = class_names[prediction]
+                
+                # Convert to Python float safely
+                confidence_pct = confidence * 100
+                happy_pct = probabilities[0][0].item() * 100
+                sad_pct = probabilities[0][1].item() * 100
+                
+                # Display result
+                if predicted_class == 'Happy':
+                    st.markdown(f"""
+                    <div class="result-box happy">
+                        <h1 style="font-size: 3rem;">Happy</h1>
+                        <p style="font-size: 1.2rem;">Confidence: {confidence_pct:.1f}%</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.markdown(f"""
+                    <div class="result-box sad">
+                        <h1 style="font-size: 3rem;">Sad</h1>
+                        <p style="font-size: 1.2rem;">Confidence: {confidence_pct:.1f}%</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                # Confidence bars
+                st.markdown("#### Confidence Distribution")
+                col1_bar, col2_bar = st.columns(2)
+                
+                with col1_bar:
+                    st.write("Happy")
+                    fill_class = "happy" if predicted_class == 'Happy' else ""
+                    st.markdown(f"""
+                    <div class="confidence-bar">
+                        <div class="confidence-fill {fill_class}" style="width: {happy_pct:.1f}%;">
+                            {happy_pct:.1f}%
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                with col2_bar:
+                    st.write("Sad")
+                    fill_class = "sad" if predicted_class == 'Sad' else ""
+                    st.markdown(f"""
+                    <div class="confidence-bar">
+                        <div class="confidence-fill {fill_class}" style="width: {sad_pct:.1f}%;">
+                            {sad_pct:.1f}%
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                if confidence_pct < 85:
+                    st.warning("Low confidence (< 85%). Manual review recommended.")
+                else:
+                    st.success("High confidence prediction.")
+                
+            except Exception as e:
+                st.error(f"Prediction error: {e}")
+                st.info("Please try again with different inputs.")
 
-with col2:
-    st.markdown("### Results")
-    
-    if analyze_button and uploaded_image is not None and text_input.strip():
-        if model is None:
-            st.error("Model not loaded. Please check:")
-            st.info("1. Google Drive files are publicly shared")
-            st.info("2. File IDs are correct in the code")
-            st.info("3. Internet connection is available")
-        else:
-            with st.spinner("Analyzing emotion..."):
-                try:
-                    image_tensor = preprocess_image(image)
-                    text_tensor = tokenize_text(text_input, word_to_idx, max_len=100)
-                    prediction, confidence, probabilities = predict(model, image_tensor, text_tensor, device)
-                    
-                    class_names = ['Happy', 'Sad']
-                    predicted_class = class_names[prediction]
-                    
-                    # Convert to Python float safely
-                    confidence_pct = confidence * 100
-                    happy_pct = probabilities[0][0].item() * 100
-                    sad_pct = probabilities[0][1].item() * 100
-                    
-                    # Display result
-                    if predicted_class == 'Happy':
-                        st.markdown(f"""
-                        <div class="result-box happy">
-                            <h1 style="font-size: 3rem;">Happy</h1>
-                            <p style="font-size: 1.2rem;">Confidence: {confidence_pct:.1f}%</p>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    else:
-                        st.markdown(f"""
-                        <div class="result-box sad">
-                            <h1 style="font-size: 3rem;">Sad</h1>
-                            <p style="font-size: 1.2rem;">Confidence: {confidence_pct:.1f}%</p>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    
-                    # Confidence bars
-                    st.markdown("#### Confidence Distribution")
-                    col1_bar, col2_bar = st.columns(2)
-                    
-                    with col1_bar:
-                        st.write("Happy")
-                        fill_class = "happy" if predicted_class == 'Happy' else ""
-                        st.markdown(f"""
-                        <div class="confidence-bar">
-                            <div class="confidence-fill {fill_class}" style="width: {happy_pct:.1f}%;">
-                                {happy_pct:.1f}%
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    
-                    with col2_bar:
-                        st.write("Sad")
-                        fill_class = "sad" if predicted_class == 'Sad' else ""
-                        st.markdown(f"""
-                        <div class="confidence-bar">
-                            <div class="confidence-fill {fill_class}" style="width: {sad_pct:.1f}%;">
-                                {sad_pct:.1f}%
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    
-                    if confidence_pct < 85:
-                        st.warning("Low confidence (< 85%). Manual review recommended.")
-                    else:
-                        st.success("High confidence prediction.")
-                    
-                    # Metrics
-                    st.markdown("---")
-                    st.markdown("#### Performance Metrics")
-                    col_m1, col_m2, col_m3 = st.columns(3)
-                    
-                    with col_m1:
-                        st.markdown(f"""
-                        <div class="metric-card">
-                            <div class="metric-value">{confidence_pct:.1f}%</div>
-                            <div class="metric-label">Confidence</div>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    
-                    with col_m2:
-                        st.markdown(f"""
-                        <div class="metric-card">
-                            <div class="metric-value">{predicted_class}</div>
-                            <div class="metric-label">Prediction</div>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    
-                    with col_m3:
-                        st.markdown(f"""
-                        <div class="metric-card">
-                            <div class="metric-value">91.12%</div>
-                            <div class="metric-label">Model Accuracy</div>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    
-                except Exception as e:
-                    st.error(f"Prediction error: {e}")
-                    st.info("Please try again with different inputs.")
-    
-    elif analyze_button:
-        if uploaded_image is None:
-            st.warning("Please upload a drawing image.")
-        if not text_input.strip():
-            st.warning("Please enter self-reflection text.")
+elif analyze_button:
+    if uploaded_image is None:
+        st.warning("Please upload a drawing image.")
+    if not text_input.strip():
+        st.warning("Please enter self-reflection text.")
 
 # ============================================================================
 # FOOTER
