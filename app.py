@@ -20,12 +20,12 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ============================================================================
-# GOOGLE DRIVE FILE IDs
+# GOOGLE DRIVE FILE IDs - UPDATED
 # ============================================================================
 
 # Model: MM_MobileNetV2_BiLSTM
-MODEL_FILE_ID = "11lYY2-0tXlF4mE1peB2ReQy9bMLlp2mp"      # <-- REPLACE WITH ACTUAL MODEL FILE ID
-VOCAB_FILE_ID = "1r2mCVi-tVjeI18P2dBFFdlYAeHNuKnm-"      # <-- REPLACE WITH ACTUAL VOCAB FILE ID
+MODEL_FILE_ID = "11lYY2-0tXlF4mE1peB2ReQy9bMLlp2mp"
+VOCAB_FILE_ID = "1r2mCVi-tVjeI18P2dBFFdlYAeHNuKnm-"
 
 MODEL_FILE_NAME = "MM_MobileNetV2_BiLSTM_final.pt"
 VOCAB_FILE_NAME = "vocabulary.pth"
@@ -282,7 +282,7 @@ def predict(model, image, text_tensor, device):
     return prediction, confidence, probabilities
 
 # ============================================================================
-# L32 GRAD-CAM (Layer 32 / Layer 33) - MobileNetV2 specific
+# L32 GRAD-CAM (Layer 32) - MobileNetV2 specific
 # ============================================================================
 
 def get_mobilenetv2_target_layer(model):
@@ -291,10 +291,6 @@ def get_mobilenetv2_target_layer(model):
     MobileNetV2 features are sequential. Layer 32 corresponds to the
     last convolutional layer before the final pooling.
     """
-    # MobileNetV2 features: 0-18 layers
-    # Layer 32 is the last layer in features (index 18)
-    # Features layer count: 19 total (0-18)
-    # The last layer (index 18) is the final conv block
     if hasattr(model.vision, 'features'):
         # Get the last layer of features (L32 in MobileNetV2 terminology)
         target_layer = model.vision.features[-1]
@@ -395,10 +391,9 @@ def generate_l32_gradcam(model, image, text_tensor, device, target_class=None):
 # LIME FOR TEXT EXPLANATION
 # ============================================================================
 
-def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50, num_samples=100):
+def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50):
     """
     Generate LIME-like explanation for text using perturbation-based approach.
-    This is a simplified LIME implementation for text.
     """
     words = text.lower().split()
     if len(words) == 0:
@@ -525,20 +520,33 @@ with st.sidebar:
         result = load_vocabulary()
         if result is not None and len(result) == 2:
             word_to_idx, vocab_size = result
-            if word_to_idx is None:
+            if word_to_idx is not None:
+                st.success(f"Vocabulary loaded (Size: {vocab_size})")
+            else:
+                st.warning("Using fallback vocabulary")
                 word_to_idx = {'<PAD>': 0, '<UNK>': 1}
         else:
+            st.warning("Using fallback vocabulary")
             word_to_idx = {'<PAD>': 0, '<UNK>': 1}
-    except:
+    except Exception as e:
+        st.error(f"Vocabulary error: {e}")
+        st.warning("Using fallback vocabulary")
         word_to_idx = {'<PAD>': 0, '<UNK>': 1}
     
     if word_to_idx is not None:
         try:
             model, device = load_model(vocab_size)
             if model is not None:
-                st.success("Model ready")
+                st.success("Model ready!")
+            else:
+                st.error("Model not loaded")
+                st.info("Make sure Google Drive files are publicly accessible:")
+                st.code(f"Model ID: {MODEL_FILE_ID}")
+                st.code(f"Vocab ID: {VOCAB_FILE_ID}")
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"Model error: {e}")
+    else:
+        st.error("Cannot load model without vocabulary")
 
 # ============================================================================
 # MAIN CONTENT
@@ -577,7 +585,11 @@ with col2:
     
     if analyze_button and uploaded_image is not None and text_input.strip():
         if model is None:
-            st.error("Model not loaded")
+            st.error("Model not loaded. Please check:")
+            st.info("1. Google Drive files are publicly shared")
+            st.info("2. File IDs are correct")
+            st.code(f"Model ID: {MODEL_FILE_ID}")
+            st.code(f"Vocab ID: {VOCAB_FILE_ID}")
         else:
             with st.spinner("Analyzing..."):
                 try:
