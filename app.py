@@ -20,10 +20,9 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ============================================================================
-# GOOGLE DRIVE FILE IDs - UPDATED
+# GOOGLE DRIVE FILE IDs - CONFIRMED
 # ============================================================================
 
-# Model: MM_MobileNetV2_BiLSTM
 MODEL_FILE_ID = "11lYY2-0tXlF4mE1peB2ReQy9bMLlp2mp"
 VOCAB_FILE_ID = "1r2mCVi-tVjeI18P2dBFFdlYAeHNuKnm-"
 
@@ -123,20 +122,30 @@ def create_text_encoder(text_type, vocab_size, hidden=128):
         raise ValueError(f"Unknown text encoder: {text_type}")
 
 # ============================================================================
-# DOWNLOAD FUNCTIONS
+# DOWNLOAD FUNCTIONS WITH DEBUGGING
 # ============================================================================
 
 def download_file_gdown(file_id, file_name, description):
     try:
         url = f"https://drive.google.com/uc?id={file_id}"
+        st.info(f"📥 Attempting gdown download from: {url}")
         gdown.download(url, file_name, quiet=False)
-        return True
+        
+        # Check if file was created
+        if os.path.exists(file_name):
+            size = os.path.getsize(file_name)
+            st.info(f"✅ Downloaded {file_name} ({size/1024:.1f} KB)")
+            return True
+        else:
+            st.warning(f"File not created after gdown download")
+            return False
     except Exception as e:
-        st.warning(f"gdown failed for {description}: {e}")
+        st.warning(f"gdown failed: {e}")
         return False
 
 def download_file_requests(file_id, file_name, description):
     try:
+        st.info(f"📥 Attempting requests download for {description}")
         url = f"https://drive.google.com/uc?export=download&id={file_id}"
         session = requests.Session()
         response = session.get(url, stream=True)
@@ -152,40 +161,61 @@ def download_file_requests(file_id, file_name, description):
             with open(file_name, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
-            return True
+            
+            if os.path.exists(file_name):
+                size = os.path.getsize(file_name)
+                st.info(f"✅ Downloaded {file_name} ({size/1024:.1f} KB)")
+                return True
         return False
     except Exception as e:
-        st.warning(f"Requests failed for {description}: {e}")
+        st.warning(f"Requests failed: {e}")
         return False
 
 def download_file(file_id, file_name, description):
+    """Try multiple methods to download."""
+    
+    st.info(f"🔍 Downloading {description}...")
+    
+    # Method 1: gdown
     if download_file_gdown(file_id, file_name, description):
         return True
+    
+    # Method 2: requests
     if download_file_requests(file_id, file_name, description):
         return True
-    st.error(f"All download methods failed for {description}")
+    
+    st.error(f"❌ All download methods failed for {description}")
     return False
 
 # ============================================================================
-# LOAD FUNCTIONS
+# LOAD FUNCTIONS WITH DEBUGGING
 # ============================================================================
 
 def load_vocabulary():
     try:
-        if not os.path.exists(VOCAB_FILE_NAME):
-            with st.spinner("Downloading vocabulary..."):
-                success = download_file(VOCAB_FILE_ID, VOCAB_FILE_NAME, "vocabulary")
-                if not success:
-                    return None, None
+        # Check if file exists
+        if os.path.exists(VOCAB_FILE_NAME):
+            st.info(f"✅ Vocabulary file already exists: {VOCAB_FILE_NAME}")
+        else:
+            st.info(f"📥 Vocabulary file not found. Downloading...")
+            success = download_file(VOCAB_FILE_ID, VOCAB_FILE_NAME, "vocabulary")
+            if not success:
+                st.error("Failed to download vocabulary")
+                return None, None
         
+        # Check file size
         file_size = os.path.getsize(VOCAB_FILE_NAME)
+        st.info(f"📊 Vocabulary file size: {file_size/1024:.1f} KB")
+        
         if file_size < 1000:
-            st.warning(f"Vocabulary file too small ({file_size} bytes). Re-downloading...")
+            st.warning(f"Vocabulary file too small ({file_size} bytes). Deleting and re-downloading...")
             os.remove(VOCAB_FILE_NAME)
             success = download_file(VOCAB_FILE_ID, VOCAB_FILE_NAME, "vocabulary")
             if not success:
                 return None, None
         
+        # Load vocabulary
+        st.info("📖 Loading vocabulary...")
         vocab_data = torch.load(VOCAB_FILE_NAME, map_location='cpu')
         
         if isinstance(vocab_data, dict):
@@ -194,43 +224,64 @@ def load_vocabulary():
             word_to_idx = vocab_data
         
         vocab_size = len(word_to_idx)
+        st.success(f"✅ Vocabulary loaded! Size: {vocab_size}")
         return word_to_idx, vocab_size
         
     except Exception as e:
-        st.error(f"Error loading vocabulary: {e}")
+        st.error(f"❌ Error loading vocabulary: {e}")
         return None, None
 
 def load_model(vocab_size):
     try:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        st.info(f"🖥️ Using device: {device}")
         
-        if not os.path.exists(MODEL_FILE_NAME):
-            with st.spinner("Downloading model (this may take a few minutes)..."):
-                success = download_file(MODEL_FILE_ID, MODEL_FILE_NAME, "model")
-                if not success:
-                    return None, device
+        # Check if model exists
+        if os.path.exists(MODEL_FILE_NAME):
+            st.info(f"✅ Model file already exists: {MODEL_FILE_NAME}")
+        else:
+            st.info(f"📥 Model file not found. Downloading...")
+            success = download_file(MODEL_FILE_ID, MODEL_FILE_NAME, "model")
+            if not success:
+                st.error("Failed to download model")
+                return None, device
         
+        # Check file size
         file_size = os.path.getsize(MODEL_FILE_NAME)
+        st.info(f"📊 Model file size: {file_size/1024:.1f} KB")
+        
         if file_size < 1000000:
-            st.warning(f"Model file too small ({file_size/1024:.1f} KB). Re-downloading...")
+            st.warning(f"Model file too small ({file_size/1024:.1f} KB). Deleting and re-downloading...")
             os.remove(MODEL_FILE_NAME)
             success = download_file(MODEL_FILE_ID, MODEL_FILE_NAME, "model")
             if not success:
                 return None, device
         
+        # Create model
+        st.info("🔧 Creating model architecture...")
         text_enc = create_text_encoder('bilstm', vocab_size, hidden=128)
         model = MultimodalModel('mobilenet_v2', text_enc)
         
+        # Load weights
+        st.info("📂 Loading model weights...")
         checkpoint = torch.load(MODEL_FILE_NAME, map_location=device)
-        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            st.info("✅ Loaded checkpoint with 'model_state_dict'")
+        else:
+            state_dict = checkpoint
+            st.info("✅ Loaded checkpoint (direct state_dict)")
+        
         model.load_state_dict(state_dict)
         
         model.to(device)
         model.eval()
+        st.success("✅ Model loaded successfully!")
         return model, device
         
     except Exception as e:
-        st.error(f"Error loading model: {e}")
+        st.error(f"❌ Error loading model: {e}")
         return None, torch.device('cpu')
 
 # ============================================================================
@@ -286,17 +337,10 @@ def predict(model, image, text_tensor, device):
 # ============================================================================
 
 def get_mobilenetv2_target_layer(model):
-    """
-    Get Layer 32 (L32) of MobileNetV2 for Grad-CAM.
-    MobileNetV2 features are sequential. Layer 32 corresponds to the
-    last convolutional layer before the final pooling.
-    """
     if hasattr(model.vision, 'features'):
-        # Get the last layer of features (L32 in MobileNetV2 terminology)
         target_layer = model.vision.features[-1]
         return target_layer
     else:
-        # Fallback: use the last conv layer
         last_conv = None
         for name, module in model.vision.named_modules():
             if isinstance(module, nn.Conv2d):
@@ -304,25 +348,17 @@ def get_mobilenetv2_target_layer(model):
         return last_conv
 
 def upsample_heatmap(heatmap, target_size):
-    """Upsample heatmap using PyTorch interpolate."""
     import torch.nn.functional as F
     heatmap_tensor = torch.tensor(heatmap).unsqueeze(0).unsqueeze(0).float()
     upsampled = F.interpolate(heatmap_tensor, size=target_size, mode='bilinear', align_corners=False)
     return upsampled.squeeze().cpu().numpy()
 
 def generate_l32_gradcam(model, image, text_tensor, device, target_class=None):
-    """
-    Generate L32 Grad-CAM for MobileNetV2.
-    Uses Layer 32 (the last conv layer) as the target.
-    """
     try:
-        # Get L32 target layer (last conv layer of MobileNetV2)
         target_layer = get_mobilenetv2_target_layer(model)
-        
         if target_layer is None:
             return None
         
-        # Register forward hook to capture activations
         activations = None
         gradients = None
         
@@ -334,50 +370,34 @@ def generate_l32_gradcam(model, image, text_tensor, device, target_class=None):
             nonlocal gradients
             gradients = grad_output[0]
         
-        # Register hooks
         forward_handle = target_layer.register_forward_hook(forward_hook)
         backward_handle = target_layer.register_backward_hook(backward_hook)
         
-        # Forward pass
         image = image.to(device)
         text_tensor = text_tensor.to(device)
-        
-        # Enable gradient for Grad-CAM
         image.requires_grad = True
         
-        # Forward through the model
         outputs = model(image, text_tensor)
         
-        # Get target class (if not specified, use predicted class)
         if target_class is None:
             target_class = torch.argmax(outputs, dim=1).item()
         
-        # Backward pass for target class
         model.zero_grad()
         outputs[0][target_class].backward()
         
-        # Remove hooks
         forward_handle.remove()
         backward_handle.remove()
         
-        # Generate heatmap from activations and gradients
         if activations is not None and gradients is not None:
-            # Global average pooling of gradients
             pooled_gradients = torch.mean(gradients, dim=[0, 2, 3])
-            
-            # Weighted combination of activation maps
             for i in range(activations.size(1)):
                 activations[:, i, :, :] *= pooled_gradients[i]
             
-            # Average over channels
             heatmap = torch.mean(activations, dim=1).squeeze().cpu().detach().numpy()
-            
-            # ReLU and normalize
             heatmap = np.maximum(heatmap, 0)
             if np.max(heatmap) > 0:
                 heatmap = heatmap / np.max(heatmap)
             
-            # Upsample to input size
             heatmap_resized = upsample_heatmap(heatmap, (224, 224))
             return heatmap_resized
         
@@ -392,18 +412,12 @@ def generate_l32_gradcam(model, image, text_tensor, device, target_class=None):
 # ============================================================================
 
 def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50):
-    """
-    Generate LIME-like explanation for text using perturbation-based approach.
-    """
     words = text.lower().split()
     if len(words) == 0:
         return None, []
     
-    # Get base prediction for the original text
     text_tensor = tokenize_text(text, word_to_idx, max_len)
     text_tensor = text_tensor.to(device)
-    
-    # Create a dummy image tensor (black image) for text-only explanation
     dummy_image = torch.zeros(1, 3, 224, 224).to(device)
     
     with torch.no_grad():
@@ -411,11 +425,8 @@ def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50)
         base_probs = torch.softmax(outputs, dim=1).cpu().numpy()[0]
         base_pred = np.argmax(base_probs)
     
-    # Perturb words and measure impact
     word_importance = []
-    
     for i, word in enumerate(words):
-        # Remove word and measure change in prediction
         perturbed_words = words[:i] + words[i+1:]
         perturbed_text = ' '.join(perturbed_words)
         
@@ -429,11 +440,9 @@ def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50)
             perturbed_outputs = model(dummy_image, perturbed_tensor)
             perturbed_probs = torch.softmax(perturbed_outputs, dim=1).cpu().numpy()[0]
         
-        # Calculate importance as change in confidence for the base prediction
         importance = abs(base_probs[base_pred] - perturbed_probs[base_pred])
         word_importance.append((word, importance))
     
-    # Normalize importance scores
     if len(word_importance) > 0:
         max_imp = max([imp for _, imp in word_importance])
         if max_imp > 0:
@@ -468,17 +477,16 @@ st.markdown("""
     .model-info table { width: 100%; font-size: 0.8rem; }
     .model-info td { padding: 2px 6px; }
     .model-info .label { font-weight: 600; color: #495057; }
-    .xai-header { font-size: 1rem; font-weight: 600; color: #2c3e50; margin: 10px 0 5px 0; }
-    .word-highlight { display: inline-block; padding: 2px 6px; margin: 1px; border-radius: 4px; font-size: 0.9rem; transition: all 0.3s; }
+    .word-highlight { display: inline-block; padding: 2px 6px; margin: 1px; border-radius: 4px; font-size: 0.9rem; }
     .word-highlight.high { background: #dc3545; color: white; }
     .word-highlight.medium { background: #ffc107; color: #333; }
     .word-highlight.low { background: #e9ecef; color: #333; }
-    .explanation-caption { font-size: 0.7rem; color: #7f8c8d; font-style: italic; }
+    .debug-box { background: #f8f9fa; padding: 10px; border-radius: 8px; border: 1px solid #ffc107; font-size: 0.8rem; margin: 10px 0; }
 </style>
 """, unsafe_allow_html=True)
 
 # ============================================================================
-# SIDEBAR
+# SIDEBAR - LOAD RESOURCES WITH DEBUGGING
 # ============================================================================
 
 with st.sidebar:
@@ -507,44 +515,53 @@ with st.sidebar:
     
     st.markdown("**Clinical Disclaimer:** Screening only. Confidence < 85% → Manual review.")
     
-    # Load resources
     st.markdown("---")
-    st.markdown("Loading resources...")
+    st.markdown("### Loading Resources...")
+    
+    # DEBUG: Show file IDs
+    with st.expander("🔧 Debug Info"):
+        st.code(f"Model ID: {MODEL_FILE_ID}")
+        st.code(f"Vocab ID: {VOCAB_FILE_ID}")
+        st.code(f"Model File: {MODEL_FILE_NAME}")
+        st.code(f"Vocab File: {VOCAB_FILE_NAME}")
     
     word_to_idx = None
     vocab_size = 3423
     model = None
     device = torch.device('cpu')
     
+    # Try loading vocabulary
     try:
         result = load_vocabulary()
         if result is not None and len(result) == 2:
             word_to_idx, vocab_size = result
             if word_to_idx is not None:
-                st.success(f"Vocabulary loaded (Size: {vocab_size})")
+                st.success(f"✅ Vocabulary loaded (Size: {vocab_size})")
             else:
-                st.warning("Using fallback vocabulary")
+                st.warning("⚠️ Vocabulary returned None - using fallback")
                 word_to_idx = {'<PAD>': 0, '<UNK>': 1}
         else:
-            st.warning("Using fallback vocabulary")
+            st.warning("⚠️ No vocabulary - using fallback")
             word_to_idx = {'<PAD>': 0, '<UNK>': 1}
     except Exception as e:
-        st.error(f"Vocabulary error: {e}")
+        st.error(f"❌ Vocabulary error: {e}")
         st.warning("Using fallback vocabulary")
         word_to_idx = {'<PAD>': 0, '<UNK>': 1}
     
+    # Try loading model
     if word_to_idx is not None:
         try:
             model, device = load_model(vocab_size)
             if model is not None:
-                st.success("Model ready!")
+                st.success("✅ Model ready!")
             else:
-                st.error("Model not loaded")
-                st.info("Make sure Google Drive files are publicly accessible:")
-                st.code(f"Model ID: {MODEL_FILE_ID}")
-                st.code(f"Vocab ID: {VOCAB_FILE_ID}")
+                st.error("❌ Model not loaded")
+                st.info("Troubleshooting tips:")
+                st.info("1. Verify Google Drive links work in browser")
+                st.info("2. Check if files are publicly shared")
+                st.info("3. Try downloading manually and placing in repo")
         except Exception as e:
-            st.error(f"Model error: {e}")
+            st.error(f"❌ Model error: {e}")
     else:
         st.error("Cannot load model without vocabulary")
 
@@ -552,8 +569,13 @@ with st.sidebar:
 # MAIN CONTENT
 # ============================================================================
 
-st.markdown('<div class="main-header">Multimodal Emotion Classifier</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header">🎨 Multimodal Emotion Classifier</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | Children\'s Drawing + Self-Reflection Analysis</div>', unsafe_allow_html=True)
+
+# If model not loaded, show warning prominently
+if model is None:
+    st.warning("⚠️ Model not loaded. Please check the sidebar for debug information.")
+    st.info("💡 You can still upload inputs, but predictions will not work until the model loads.")
 
 # Compact 2-column layout
 col1, col2 = st.columns([1, 1])
@@ -585,11 +607,15 @@ with col2:
     
     if analyze_button and uploaded_image is not None and text_input.strip():
         if model is None:
-            st.error("Model not loaded. Please check:")
+            st.error("❌ Model not loaded. Please check:")
             st.info("1. Google Drive files are publicly shared")
             st.info("2. File IDs are correct")
-            st.code(f"Model ID: {MODEL_FILE_ID}")
-            st.code(f"Vocab ID: {VOCAB_FILE_ID}")
+            st.info("3. Internet connection is available")
+            
+            # Show manual download links
+            st.markdown("**Manual Download Links:**")
+            st.code(f"Model: https://drive.google.com/file/d/{MODEL_FILE_ID}/view")
+            st.code(f"Vocab: https://drive.google.com/file/d/{VOCAB_FILE_ID}/view")
         else:
             with st.spinner("Analyzing..."):
                 try:
@@ -608,14 +634,14 @@ with col2:
                     if predicted_class == 'Happy':
                         st.markdown(f"""
                         <div class="result-box happy">
-                            <h2 style="margin: 0;">Happy</h2>
+                            <h2 style="margin: 0;">😊 Happy</h2>
                             <p style="font-size: 1rem; margin: 0;">Confidence: {confidence_pct:.1f}%</p>
                         </div>
                         """, unsafe_allow_html=True)
                     else:
                         st.markdown(f"""
                         <div class="result-box sad">
-                            <h2 style="margin: 0;">Sad</h2>
+                            <h2 style="margin: 0;">😢 Sad</h2>
                             <p style="font-size: 1rem; margin: 0;">Confidence: {confidence_pct:.1f}%</p>
                         </div>
                         """, unsafe_allow_html=True)
@@ -643,13 +669,11 @@ with col2:
                         """, unsafe_allow_html=True)
                     
                     if confidence_pct < 85:
-                        st.warning("Low confidence - Manual review recommended")
+                        st.warning("⚠️ Low confidence - Manual review recommended")
                     else:
-                        st.success("High confidence prediction")
+                        st.success("✅ High confidence prediction")
                     
-                    # =========================================================
-                    # L32 GRAD-CAM - Visual Explanation
-                    # =========================================================
+                    # L32 GRAD-CAM
                     st.markdown("---")
                     st.markdown("### L32 Grad-CAM: Visual Attention")
                     st.caption("Layer 32 - Last convolutional layer of MobileNetV2")
@@ -659,17 +683,14 @@ with col2:
                     if heatmap is not None:
                         fig, axes = plt.subplots(1, 3, figsize=(9, 3))
                         
-                        # Original image
                         axes[0].imshow(image.resize((224, 224)))
                         axes[0].set_title("Original")
                         axes[0].axis('off')
                         
-                        # Heatmap only
                         axes[1].imshow(heatmap, cmap='jet')
                         axes[1].set_title("L32 Grad-CAM")
                         axes[1].axis('off')
                         
-                        # Overlay
                         axes[2].imshow(image.resize((224, 224)))
                         axes[2].imshow(heatmap, cmap='jet', alpha=0.5)
                         axes[2].set_title("Overlay")
@@ -681,18 +702,14 @@ with col2:
                     else:
                         st.info("L32 Grad-CAM explanation not available")
                     
-                    # =========================================================
-                    # LIME - Text Explanation
-                    # =========================================================
+                    # LIME for text
                     st.markdown("### LIME: Text Explanation")
                     
-                    # Generate LIME explanation
                     base_pred, word_importance = generate_lime_text_explanation(
                         text_input, model, word_to_idx, device, max_len=50
                     )
                     
                     if word_importance and len(word_importance) > 0:
-                        # Display highlighted words
                         highlighted_words = []
                         for word, importance in word_importance:
                             if importance > 0.7:
@@ -710,21 +727,20 @@ with col2:
                             unsafe_allow_html=True
                         )
                         
-                        st.caption("High importance = Red | Medium = Yellow | Low = Gray")
-                        
-                        # Show class prediction for explanation
+                        st.caption("🔴 High importance | 🟡 Medium | ⚪ Low")
                         class_names_expl = ['Happy', 'Sad']
-                        st.caption(f"Prediction based on text: {class_names_expl[base_pred]}")
+                        st.caption(f"Text-based prediction: {class_names_expl[base_pred]}")
                     else:
-                        st.info("LIME explanation not available for this text")
+                        st.info("LIME explanation not available")
                     
                 except Exception as e:
-                    st.error(f"Error: {e}")
+                    st.error(f"❌ Error: {e}")
+                    st.info("Please try again with different inputs.")
     elif analyze_button:
         if uploaded_image is None:
-            st.warning("Upload a drawing")
+            st.warning("⚠️ Upload a drawing")
         if not text_input.strip():
-            st.warning("Enter text")
+            st.warning("⚠️ Enter text")
 
 # ============================================================================
 # FOOTER
