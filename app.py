@@ -3,6 +3,7 @@ Multimodal Emotion Classification System
 Deployed on Streamlit Cloud
 Model: EfficientNet-B0 + BiLSTM (91.12% accuracy)
 Model stored on Google Drive - Downloaded at runtime
+Vocabulary loaded from saved vocabulary.pth
 """
 
 import streamlit as st
@@ -14,18 +15,23 @@ import numpy as np
 import matplotlib.pyplot as plt
 import gdown
 import os
+import pickle
 import warnings
 warnings.filterwarnings('ignore')
 
 # ============================================================================
-# GOOGLE DRIVE MODEL ID
+# GOOGLE DRIVE FILE IDs
 # ============================================================================
 
-# Replace with your Google Drive file ID
+# Replace with your Google Drive file IDs
 # To get this: Right-click on your file in Google Drive -> Share -> Copy link
 # Example: https://drive.google.com/file/d/1ABC123XYZ456789/view -> ID is 1ABC123XYZ456789
-MODEL_FILE_ID = "YOUR_FILE_ID_HERE"  # <-- REPLACE WITH YOUR ACTUAL FILE ID
+
+MODEL_FILE_ID = "11lYY2-0tXlF4mE1peB2ReQy9bMLlp2mp"      # <-- REPLACE WITH YOUR ACTUAL MODEL FILE ID https://drive.google.com/file/d/1r2mCVi-tVjeI18P2dBFFdlYAeHNuKnm-/view?usp=drive_link
+VOCAB_FILE_ID = "1r2mCVi-tVjeI18P2dBFFdlYAeHNuKnm-"      # <-- REPLACE WITH YOUR ACTUAL VOCAB FILE ID https://drive.google.com/file/d/11lYY2-0tXlF4mE1peB2ReQy9bMLlp2mp/view?usp=drive_link
+
 MODEL_FILE_NAME = "best_model_efficientnet_b0_bilstm.pth"
+VOCAB_FILE_NAME = "vocabulary.pth"
 
 # ============================================================================
 # MODEL DEFINITIONS
@@ -154,36 +160,73 @@ def create_text_encoder(text_type, vocab_size, hidden=128):
         raise ValueError(f"Unknown text encoder: {text_type}")
 
 # ============================================================================
+# LOAD VOCABULARY FROM GOOGLE DRIVE
+# ============================================================================
+
+@st.cache_resource
+def load_vocabulary():
+    """Download vocabulary from Google Drive and load it."""
+    
+    if not os.path.exists(VOCAB_FILE_NAME):
+        st.info("📥 Downloading vocabulary from Google Drive...")
+        
+        try:
+            url = f"https://drive.google.com/uc?id={VOCAB_FILE_ID}"
+            gdown.download(url, VOCAB_FILE_NAME, quiet=False)
+            st.success("✅ Vocabulary downloaded successfully!")
+        except Exception as e:
+            st.error(f"❌ Failed to download vocabulary: {e}")
+            return None
+    
+    try:
+        # Load vocabulary
+        vocab_data = torch.load(VOCAB_FILE_NAME, map_location='cpu')
+        
+        # Extract vocabulary
+        if isinstance(vocab_data, dict):
+            if 'word_to_idx' in vocab_data:
+                word_to_idx = vocab_data['word_to_idx']
+            else:
+                word_to_idx = vocab_data
+        else:
+            word_to_idx = vocab_data
+        
+        vocab_size = len(word_to_idx)
+        st.info(f"✅ Vocabulary loaded! Size: {vocab_size}")
+        
+        return word_to_idx, vocab_size
+        
+    except Exception as e:
+        st.error(f"❌ Error loading vocabulary: {e}")
+        return None, None
+
+# ============================================================================
 # LOAD MODEL FROM GOOGLE DRIVE
 # ============================================================================
 
 @st.cache_resource
-def load_model_from_drive():
+def load_model_from_drive(vocab_size):
     """Download model from Google Drive and load it."""
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Check if model already exists locally
     if not os.path.exists(MODEL_FILE_NAME):
         st.info("📥 Downloading model from Google Drive (this may take a moment)...")
         
-        # Download from Google Drive using gdown
         try:
             url = f"https://drive.google.com/uc?id={MODEL_FILE_ID}"
             gdown.download(url, MODEL_FILE_NAME, quiet=False)
             st.success("✅ Model downloaded successfully!")
         except Exception as e:
             st.error(f"❌ Failed to download model: {e}")
-            st.warning("Please ensure the MODEL_FILE_ID is correct and the file is publicly accessible.")
             return None, device
     
     # Model configuration - BEST PERFORMING MODEL
     vision_name = "efficientnet_b0"
     text_type = "bilstm"
-    vocab_size = 3423  # Your actual vocabulary size
     hidden = 128
     
-    # Create text encoder
+    # Create text encoder with correct vocabulary size
     text_enc = create_text_encoder(text_type, vocab_size, hidden)
     
     # Create model
@@ -211,6 +254,33 @@ def load_model_from_drive():
         return None, device
 
 # ============================================================================
+# TEXT TOKENIZATION WITH VOCABULARY
+# ============================================================================
+
+def tokenize_text(text, word_to_idx, max_len=100):
+    """Tokenize text using the loaded vocabulary."""
+    
+    # Convert to lowercase and split
+    tokens = text.lower().split()
+    
+    # Convert to token IDs using vocabulary
+    token_ids = []
+    for token in tokens:
+        if token in word_to_idx:
+            token_ids.append(word_to_idx[token])
+        else:
+            token_ids.append(word_to_idx['<UNK>'])  # Unknown token
+    
+    # Truncate or pad to max length
+    if len(token_ids) > max_len:
+        token_ids = token_ids[:max_len]
+    else:
+        # Pad with <PAD> token (index 0)
+        token_ids = token_ids + [0] * (max_len - len(token_ids))
+    
+    return torch.tensor(token_ids).unsqueeze(0)
+
+# ============================================================================
 # PREPROCESSING FUNCTIONS
 # ============================================================================
 
@@ -227,27 +297,6 @@ def preprocess_image(image):
     if isinstance(image, Image.Image):
         return image_transform(image).unsqueeze(0)
     return image
-
-def preprocess_text(text, vocab_size):
-    """Convert text to tokenized tensor (simplified)."""
-    # Simple tokenization - replace with your actual tokenizer
-    tokens = text.lower().split()
-    # Simple hash-based vocabulary mapping (for demo)
-    # In production, use your actual vocabulary
-    token_ids = []
-    for token in tokens:
-        # Simple hash to get consistent IDs
-        token_id = hash(token) % (vocab_size - 2) + 1  # 1 = unknown token
-        token_ids.append(token_id)
-    
-    # Truncate or pad to max length
-    max_len = 100
-    if len(token_ids) > max_len:
-        token_ids = token_ids[:max_len]
-    else:
-        token_ids = token_ids + [0] * (max_len - len(token_ids))  # 0 = padding
-    
-    return torch.tensor(token_ids).unsqueeze(0)
 
 def predict(model, image, text_tensor, device):
     """Run prediction on model."""
@@ -358,7 +407,7 @@ st.markdown('<div class="main-header">🎨 Multimodal Emotion Classifier</div>',
 st.markdown('<div class="sub-header">Analyze children\'s drawings and self-reflections using EfficientNet-B0 + BiLSTM</div>', unsafe_allow_html=True)
 
 # ============================================================================
-# SIDEBAR - Model Info
+# SIDEBAR - Load Model and Vocabulary
 # ============================================================================
 
 with st.sidebar:
@@ -370,7 +419,7 @@ with st.sidebar:
     | **Text** | BiLSTM |
     | **Accuracy** | 91.12% |
     | **F1-Score** | 91.11% |
-    | **Vocab Size** | 3,423 |
+    | **Vocab Size** | 3,424 |
     | **Params** | 6.79M |
     | **Size** | 26.08 MB |
     """)
@@ -392,14 +441,26 @@ with st.sidebar:
     **Rejection threshold:** Confidence < 85% → Manual review recommended.
     """)
     
-    # Load model status
+    # Load vocabulary and model
     st.markdown("---")
-    with st.spinner("Loading model..."):
-        model, device = load_model_from_drive()
-        if model is not None:
-            st.success("✅ Model ready")
-        else:
-            st.error("⚠️ Model not loaded")
+    st.markdown("### 🔄 Loading Resources...")
+    
+    # Load vocabulary
+    with st.spinner("Loading vocabulary..."):
+        word_to_idx, vocab_size = load_vocabulary()
+    
+    # Load model if vocabulary loaded
+    if word_to_idx is not None:
+        with st.spinner("Loading model..."):
+            model, device = load_model_from_drive(vocab_size)
+            if model is not None:
+                st.success("✅ All resources ready!")
+            else:
+                st.error("⚠️ Model not loaded")
+    else:
+        model = None
+        device = torch.device('cpu')
+        st.error("⚠️ Vocabulary not loaded")
 
 # ============================================================================
 # MAIN CONTENT - Two Columns
@@ -425,11 +486,7 @@ with col1:
     if uploaded_image is not None:
         image = Image.open(uploaded_image).convert('RGB')
         st.image(image, caption="Uploaded Drawing", use_container_width=True)
-        
-        # Save image for Grad-CAM
-        original_image = np.array(image)
     else:
-        original_image = None
         image = None
     
     # Text input
@@ -467,9 +524,11 @@ with col2:
         else:
             with st.spinner("🧠 Analyzing emotion..."):
                 
-                # Preprocess inputs
+                # Preprocess image
                 image_tensor = preprocess_image(image)
-                text_tensor = preprocess_text(text_input, 3423)  # vocab_size
+                
+                # Tokenize text using vocabulary
+                text_tensor = tokenize_text(text_input, word_to_idx, max_len=100)
                 
                 # Run prediction
                 prediction, confidence, probabilities = predict(
