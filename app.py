@@ -551,7 +551,7 @@ def generate_gradcam_multiple(model, image, text_tensor, device, target_class=No
     conv_layers = get_conv_layers(model)
     num_layers = len(conv_layers)
     
-    # Use layer 5 for early features, layer 18 for deep features (MobileNetV2)
+    # Use different layers for comparison
     layer_indices = [5, 10, 15, 18]  # Different depths
     layer_indices = [i for i in layer_indices if i < num_layers]
     
@@ -578,7 +578,8 @@ def generate_gradcam_multiple(model, image, text_tensor, device, target_class=No
                         'heatmap': heatmap_resized,
                         'overlay': overlay,
                         'layer': layer_idx,
-                        'variant': variant_name
+                        'variant': variant_name,
+                        'layer_name': layer_name
                     }
             except Exception as e:
                 continue
@@ -884,3 +885,17 @@ with col2:
                             cols = st.columns(len(variants))
                             
                             for idx, (col, variant) in enumerate(zip(cols, variants)):
+                                with col:
+                                    st.image(variant['heatmap'], caption=f"{variant['variant']}", use_container_width=True)
+                    else:
+                        st.info("No Grad-CAM explanations available")
+                    
+                    # ========================================================
+                    # LIME FOR TEXT
+                    # ========================================================
+                    st.markdown("---")
+                    st.markdown("### LIME: Text Explanation")
+                    
+                    if text_input.strip():
+                        base_pred, word_importance = generate_lime_text_explanation(
+                            text_input, model
