@@ -1,7 +1,7 @@
 """
 L32 Layer-Wise Grad-CAM Streamlit App
 Model: MobileNetV2 + BiLSTM (92.69% Validation Accuracy)
-Layer 32 (L32) captures high-level concepts and emotion-relevant regions
+Select any Conv2d layer for Grad-CAM visualization
 """
 
 import streamlit as st
@@ -23,7 +23,7 @@ warnings.filterwarnings('ignore')
 # ============================================================================
 
 st.set_page_config(
-    page_title="Emotion Analysis - L32 Grad-CAM",
+    page_title="Emotion Analysis - Layer-wise Grad-CAM",
     page_icon="🎨",
     layout="wide"
 )
@@ -118,6 +118,13 @@ st.markdown("""
         background: #e9ecef;
         color: #333;
     }
+    .layer-selector {
+        background: #f8f9fa;
+        padding: 15px;
+        border-radius: 8px;
+        border: 1px solid #e9ecef;
+        margin: 10px 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -126,7 +133,7 @@ st.markdown("""
 # ============================================================================
 
 st.markdown('<div class="main-header">🎨 Emotion Analysis from Children\'s Drawings</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | L32 Layer-Wise Grad-CAM Explainability</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | Layer-wise Grad-CAM Explainability</div>', unsafe_allow_html=True)
 
 # ============================================================================
 # MODEL COMPONENTS
@@ -221,37 +228,24 @@ def create_text_encoder(text_type, vocab_size, hidden=128):
         raise ValueError(f"Unknown text encoder: {text_type}")
 
 # ============================================================================
-# FIXED L32 GRAD-CAM
+# GRAD-CAM IMPLEMENTATION
 # ============================================================================
 
-def get_target_layer_l32(model):
-    """Get the 32nd convolutional layer (L32) from the vision encoder."""
-    
+def get_all_conv_layers(model):
+    """Get all Conv2d layers from the vision encoder with their indices."""
     conv_layers = []
     
-    def collect_layers(module):
-        for child in module.children():
+    def collect_layers(module, prefix=""):
+        for name, child in module.named_children():
             if isinstance(child, nn.Conv2d):
-                conv_layers.append(child)
-            collect_layers(child)
+                conv_layers.append((f"{prefix}{name}", child))
+            collect_layers(child, f"{prefix}{name}.")
     
     collect_layers(model.vision)
-    
-    st.info(f"Found {len(conv_layers)} Conv2d layers in vision encoder")
-    
-    # L32 = 32nd convolutional layer (0-indexed)
-    if len(conv_layers) > 32:
-        target = conv_layers[32]
-        st.info(f"✅ Using Layer 32 (L32): {type(target).__name__}")
-        return target
-    else:
-        # Use last layer as fallback
-        target = conv_layers[-1]
-        st.warning(f"⚠️ Only {len(conv_layers)} layers found. Using last layer as fallback.")
-        return target
+    return conv_layers
 
-class L32GradCAM:
-    """Fixed L32 Layer-Wise Grad-CAM implementation."""
+class GradCAM:
+    """Grad-CAM implementation for any target layer."""
     
     def __init__(self, model, target_layer, device):
         self.model = model
@@ -263,100 +257,49 @@ class L32GradCAM:
     
     def _register_hooks(self):
         def forward_hook(module, input, output):
-            # Store activations
             self.activations = output
             
         def backward_hook(module, grad_input, grad_output):
-            # Store gradients
             self.gradients = grad_output[0]
             
         self.target_layer.register_forward_hook(forward_hook)
         self.target_layer.register_backward_hook(backward_hook)
     
     def generate_heatmap(self, image, text_tensor, target_class=None):
-        # Clear any previous gradients
+        self.model.eval()
         self.model.zero_grad()
         self.gradients = None
         self.activations = None
         
-        # Forward pass
+        # Forward pass with gradient tracking
+        image = image.clone().to(self.device)
+        image.requires_grad = True
+        text_tensor = text_tensor.clone().to(self.device)
+        
         output = self.model(image, text_tensor)
         
         if target_class is None:
             target_class = torch.argmax(output, dim=1).item()
         
-        # Zero gradients
-        self.model.zero_grad()
-        
         # Backward pass
+        self.model.zero_grad()
         loss = output[0, target_class]
         loss.backward()
         
-        # Get gradients and activations
         gradients = self.gradients
         activations = self.activations
         
         if gradients is None or activations is None:
-            st.error("Gradients or activations are None")
             return None
         
         # Check if gradients are all zeros
         if torch.all(gradients == 0):
-            st.warning("Gradients are all zeros. Trying alternative method...")
-            return self._generate_heatmap_alternative(image, text_tensor, target_class)
+            return None
         
         # Global average pooling of gradients
         weights = torch.mean(gradients, dim=(2, 3), keepdim=True)
         
         # Weighted combination
-        cam = torch.sum(weights * activations, dim=1, keepdim=True)
-        cam = F.relu(cam)
-        
-        # Normalize
-        cam_min = torch.min(cam)
-        cam_max = torch.max(cam)
-        if cam_max - cam_min > 1e-8:
-            cam = (cam - cam_min) / (cam_max - cam_min)
-        else:
-            cam = torch.zeros_like(cam)
-        
-        # Convert to numpy
-        heatmap = cam.squeeze().detach().cpu().numpy()
-        
-        return heatmap
-    
-    def _generate_heatmap_alternative(self, image, text_tensor, target_class=None):
-        """Alternative method using guided backpropagation style."""
-        
-        # Forward pass with gradient tracking
-        image = image.clone().requires_grad_(True)
-        output = self.model(image, text_tensor)
-        
-        if target_class is None:
-            target_class = torch.argmax(output, dim=1).item()
-        
-        self.model.zero_grad()
-        loss = output[0, target_class]
-        loss.backward()
-        
-        # Get gradients from the target layer
-        gradients = self.gradients
-        activations = self.activations
-        
-        if gradients is None or activations is None:
-            return None
-        
-        # Use Grad-CAM++ style weighting
-        grad_pow = gradients.pow(2)
-        grad_pow_sum = torch.sum(grad_pow, dim=(2, 3), keepdim=True)
-        
-        # Compute weights with epsilon to avoid division by zero
-        eps = 1e-8
-        alpha_num = grad_pow
-        alpha_den = 2 * grad_pow + torch.sum(gradients * activations, dim=(2, 3), keepdim=True) + eps
-        alpha = alpha_num / (alpha_den + eps)
-        
-        weights = torch.sum(alpha * F.relu(gradients), dim=(2, 3), keepdim=True)
         cam = torch.sum(weights * activations, dim=1, keepdim=True)
         cam = F.relu(cam)
         
@@ -411,46 +354,19 @@ def create_overlay(image, heatmap, alpha=0.6):
     
     return overlay, heatmap_resized
 
-def generate_l32_gradcam(model, image_tensor, text_tensor, device, target_class=None):
-    """Generate L32 Grad-CAM explanation."""
+def generate_gradcam_for_layer(model, layer, image_tensor, text_tensor, device, target_class=None):
+    """Generate Grad-CAM for a specific layer."""
     try:
-        # Get target layer (L32)
-        target_layer = get_target_layer_l32(model)
+        gradcam = GradCAM(model, layer, device)
+        heatmap = gradcam.generate_heatmap(image_tensor, text_tensor, target_class)
         
-        if target_layer is None:
-            st.error("Target layer not found")
+        if heatmap is None or np.max(heatmap) < 0.01:
             return None, None
         
-        # Create Grad-CAM instance
-        gradcam = L32GradCAM(model, target_layer, device)
-        
-        # Ensure tensors are on correct device and require gradients
-        image = image_tensor.clone().to(device)
-        image.requires_grad = True
-        text = text_tensor.clone().to(device)
-        
-        # Generate heatmap
-        heatmap = gradcam.generate_heatmap(image, text, target_class)
-        
-        if heatmap is None:
-            st.error("Heatmap generation failed")
-            return None, None
-        
-        # Check if heatmap has any values
-        if np.max(heatmap) < 0.01:
-            st.warning("Heatmap values are very small. Trying alternative method...")
-            # Use a simple fallback: gradient of the target layer
-            return None, None
-        
-        # Create overlay
-        overlay, heatmap_resized = create_overlay(image, heatmap, alpha=0.6)
-        
+        overlay, heatmap_resized = create_overlay(image_tensor, heatmap, alpha=0.6)
         return overlay, heatmap_resized
         
     except Exception as e:
-        st.error(f"L32 Grad-CAM error: {e}")
-        import traceback
-        st.code(traceback.format_exc())
         return None, None
 
 # ============================================================================
@@ -602,6 +518,12 @@ if model is None:
     st.error("❌ Failed to load model. Please check your Google Drive files.")
     st.stop()
 
+# Get all Conv2d layers
+all_layers = get_all_conv_layers(model)
+layer_names = [f"Layer {i} - {name}" for i, (name, _) in enumerate(all_layers)]
+
+st.info(f"Found {len(all_layers)} Conv2d layers in vision encoder")
+
 # ============================================================================
 # LAYOUT - TWO COLUMNS
 # ============================================================================
@@ -634,6 +556,39 @@ with col1:
     )
     if not text_input:
         st.caption("Enter the child's self-reflection text")
+    
+    # Layer selector
+    st.subheader("🎯 Select Grad-CAM Layer")
+    
+    # Preset layer suggestions
+    st.markdown("**Preset Layers:**")
+    preset_cols = st.columns(4)
+    preset_layers = {
+        "Layer 5": 5,
+        "Layer 10": 10,
+        "Layer 20": 20,
+        "Layer 32": 32
+    }
+    
+    selected_preset = None
+    for col, (name, idx) in zip(preset_cols, preset_layers.items()):
+        if col.button(name, key=f"preset_{idx}"):
+            selected_preset = idx
+    
+    # Manual selection
+    st.markdown("**Or select manually:**")
+    selected_index = st.selectbox(
+        "Select layer index",
+        options=list(range(len(all_layers))),
+        format_func=lambda x: f"Layer {x} - {all_layers[x][0]}",
+        index=32 if len(all_layers) > 32 else 0,
+        label_visibility="collapsed"
+    )
+    
+    # Use preset if selected, otherwise use manual selection
+    layer_index = selected_preset if selected_preset is not None else selected_index
+    
+    st.caption(f"Selected: Layer {layer_index} - {all_layers[layer_index][0]}")
 
 with col2:
     st.subheader("📊 Analysis Results")
@@ -727,14 +682,16 @@ with col2:
                     st.success("✅ High confidence prediction")
                 
                 # ================================================================
-                # L32 GRAD-CAM - Visual Explanation
+                # GRAD-CAM FOR SELECTED LAYER
                 # ================================================================
                 st.markdown("---")
-                st.markdown("### 🔍 L32 Layer-Wise Grad-CAM")
-                st.caption("Layer 32 (L32) captures high-level emotion-relevant regions")
+                st.markdown(f"### 🔍 Grad-CAM - Layer {layer_index}")
+                st.caption(f"Layer: {all_layers[layer_index][0]}")
                 
-                overlay, heatmap = generate_l32_gradcam(
-                    model, image_tensor, text_tensor, device, target_class=prediction
+                target_layer = all_layers[layer_index][1]
+                
+                overlay, heatmap = generate_gradcam_for_layer(
+                    model, target_layer, image_tensor, text_tensor, device, target_class=prediction
                 )
                 
                 if overlay is not None and heatmap is not None:
@@ -747,12 +704,12 @@ with col2:
                     
                     # Heatmap only
                     axes[1].imshow(heatmap, cmap='jet')
-                    axes[1].set_title("L32 Heatmap")
+                    axes[1].set_title(f"Layer {layer_index} Heatmap")
                     axes[1].axis('off')
                     
                     # Overlay
                     axes[2].imshow(overlay)
-                    axes[2].set_title("L32 Grad-CAM Overlay")
+                    axes[2].set_title(f"Layer {layer_index} Overlay")
                     axes[2].axis('off')
                     
                     plt.tight_layout()
@@ -760,9 +717,23 @@ with col2:
                     plt.close()
                     
                     st.caption("🟡 Yellow/Red areas = Regions most important for the prediction")
-                    st.info("**L32** captures high-level concepts and complex patterns that are most relevant for emotion recognition.")
+                    
+                    # Layer info
+                    info_text = {
+                        0: "Early layer - edges and textures",
+                        5: "Basic patterns and simple shapes",
+                        10: "Mid-level features and object parts",
+                        15: "Higher-level patterns",
+                        20: "Complex shapes and structures",
+                        25: "Semantic features",
+                        30: "High-level concepts",
+                        32: "Emotion-relevant regions (L32)"
+                    }
+                    layer_info = info_text.get(layer_index, f"Layer {layer_index} - {all_layers[layer_index][0]}")
+                    st.info(f"**Layer {layer_index}:** {layer_info}")
                 else:
-                    st.info("L32 Grad-CAM explanation not available. Try a different image or layer.")
+                    st.warning(f"Grad-CAM not available for Layer {layer_index}. Try a different layer.")
+                    st.info("Some layers may not produce good visualizations. Try layers 5, 10, 15, 20, 25, or 32.")
                 
                 # ================================================================
                 # LIME - Text Explanation
@@ -818,6 +789,6 @@ with col2:
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #95a5a6; font-size: 0.7rem;">
-    MobileNetV2 + BiLSTM | L32 Layer-Wise Grad-CAM + LIME | 92.69% Val Accuracy | KIDO Dataset
+    MobileNetV2 + BiLSTM | Layer-wise Grad-CAM | 92.69% Val Accuracy | KIDO Dataset
 </div>
 """, unsafe_allow_html=True)
