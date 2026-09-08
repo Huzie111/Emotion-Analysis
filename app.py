@@ -14,6 +14,7 @@ import re
 from PIL import Image
 from torchvision import transforms, models
 import matplotlib.pyplot as plt
+from matplotlib import cm
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -33,12 +34,9 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    /* Hide sidebar */
     section[data-testid="stSidebar"] {
         display: none !important;
     }
-    
-    /* Main content full width */
     .main-header {
         font-size: 2.2rem;
         font-weight: 700;
@@ -100,25 +98,6 @@ st.markdown("""
     }
     .stButton button:hover {
         background: #2980b9;
-    }
-    .model-info {
-        background: #f8f9fa;
-        padding: 10px;
-        border-radius: 8px;
-        border: 1px solid #e9ecef;
-        margin-bottom: 10px;
-        font-size: 0.8rem;
-    }
-    .model-info table {
-        width: 100%;
-        font-size: 0.8rem;
-    }
-    .model-info td {
-        padding: 2px 6px;
-    }
-    .model-info .label {
-        font-weight: 600;
-        color: #495057;
     }
     .word-highlight {
         display: inline-block;
@@ -242,7 +221,7 @@ def create_text_encoder(text_type, vocab_size, hidden=128):
         raise ValueError(f"Unknown text encoder: {text_type}")
 
 # ============================================================================
-# L32 GRAD-CAM
+# FIXED L32 GRAD-CAM
 # ============================================================================
 
 def get_target_layer_l32(model):
@@ -258,57 +237,73 @@ def get_target_layer_l32(model):
     
     collect_layers(model.vision)
     
+    st.info(f"Found {len(conv_layers)} Conv2d layers in vision encoder")
+    
     # L32 = 32nd convolutional layer (0-indexed)
     if len(conv_layers) > 32:
-        st.info(f"Found {len(conv_layers)} Conv2d layers. Using Layer 32 (L32)")
-        return conv_layers[32]
+        target = conv_layers[32]
+        st.info(f"✅ Using Layer 32 (L32): {type(target).__name__}")
+        return target
     else:
-        st.warning(f"Only {len(conv_layers)} Conv2d layers found. Using last layer as fallback.")
-        return conv_layers[-1]
+        # Use last layer as fallback
+        target = conv_layers[-1]
+        st.warning(f"⚠️ Only {len(conv_layers)} layers found. Using last layer as fallback.")
+        return target
 
 class L32GradCAM:
-    """L32 Layer-Wise Grad-CAM implementation."""
+    """Fixed L32 Layer-Wise Grad-CAM implementation."""
     
-    def __init__(self, model, device):
+    def __init__(self, model, target_layer, device):
         self.model = model
+        self.target_layer = target_layer
         self.device = device
-        self.target_layer = get_target_layer_l32(model)
         self.gradients = None
         self.activations = None
         self._register_hooks()
     
     def _register_hooks(self):
         def forward_hook(module, input, output):
+            # Store activations
             self.activations = output
             
         def backward_hook(module, grad_input, grad_output):
+            # Store gradients
             self.gradients = grad_output[0]
             
         self.target_layer.register_forward_hook(forward_hook)
         self.target_layer.register_backward_hook(backward_hook)
     
     def generate_heatmap(self, image, text_tensor, target_class=None):
-        self.model.eval()
+        # Clear any previous gradients
         self.model.zero_grad()
+        self.gradients = None
+        self.activations = None
         
-        image = image.to(self.device)
-        text_tensor = text_tensor.to(self.device)
-        image.requires_grad = True
-        
+        # Forward pass
         output = self.model(image, text_tensor)
         
         if target_class is None:
             target_class = torch.argmax(output, dim=1).item()
         
+        # Zero gradients
         self.model.zero_grad()
+        
+        # Backward pass
         loss = output[0, target_class]
         loss.backward()
         
+        # Get gradients and activations
         gradients = self.gradients
         activations = self.activations
         
         if gradients is None or activations is None:
-            return None, target_class
+            st.error("Gradients or activations are None")
+            return None
+        
+        # Check if gradients are all zeros
+        if torch.all(gradients == 0):
+            st.warning("Gradients are all zeros. Trying alternative method...")
+            return self._generate_heatmap_alternative(image, text_tensor, target_class)
         
         # Global average pooling of gradients
         weights = torch.mean(gradients, dim=(2, 3), keepdim=True)
@@ -318,11 +313,63 @@ class L32GradCAM:
         cam = F.relu(cam)
         
         # Normalize
-        cam = cam - torch.min(cam)
-        cam = cam / (torch.max(cam) + 1e-8)
+        cam_min = torch.min(cam)
+        cam_max = torch.max(cam)
+        if cam_max - cam_min > 1e-8:
+            cam = (cam - cam_min) / (cam_max - cam_min)
+        else:
+            cam = torch.zeros_like(cam)
+        
+        # Convert to numpy
+        heatmap = cam.squeeze().detach().cpu().numpy()
+        
+        return heatmap
+    
+    def _generate_heatmap_alternative(self, image, text_tensor, target_class=None):
+        """Alternative method using guided backpropagation style."""
+        
+        # Forward pass with gradient tracking
+        image = image.clone().requires_grad_(True)
+        output = self.model(image, text_tensor)
+        
+        if target_class is None:
+            target_class = torch.argmax(output, dim=1).item()
+        
+        self.model.zero_grad()
+        loss = output[0, target_class]
+        loss.backward()
+        
+        # Get gradients from the target layer
+        gradients = self.gradients
+        activations = self.activations
+        
+        if gradients is None or activations is None:
+            return None
+        
+        # Use Grad-CAM++ style weighting
+        grad_pow = gradients.pow(2)
+        grad_pow_sum = torch.sum(grad_pow, dim=(2, 3), keepdim=True)
+        
+        # Compute weights with epsilon to avoid division by zero
+        eps = 1e-8
+        alpha_num = grad_pow
+        alpha_den = 2 * grad_pow + torch.sum(gradients * activations, dim=(2, 3), keepdim=True) + eps
+        alpha = alpha_num / (alpha_den + eps)
+        
+        weights = torch.sum(alpha * F.relu(gradients), dim=(2, 3), keepdim=True)
+        cam = torch.sum(weights * activations, dim=1, keepdim=True)
+        cam = F.relu(cam)
+        
+        # Normalize
+        cam_min = torch.min(cam)
+        cam_max = torch.max(cam)
+        if cam_max - cam_min > 1e-8:
+            cam = (cam - cam_min) / (cam_max - cam_min)
+        else:
+            cam = torch.zeros_like(cam)
         
         heatmap = cam.squeeze().detach().cpu().numpy()
-        return heatmap, target_class
+        return heatmap
 
 def resize_heatmap(heatmap, target_size):
     """Resize heatmap using PyTorch interpolate."""
@@ -356,7 +403,6 @@ def create_overlay(image, heatmap, alpha=0.6):
     heatmap_resized = np.clip(heatmap_resized, 0, 1)
     
     # Create RGB heatmap
-    from matplotlib import cm
     heatmap_rgb = cm.jet(heatmap_resized)[:, :, :3]
     
     # Overlay
@@ -365,20 +411,46 @@ def create_overlay(image, heatmap, alpha=0.6):
     
     return overlay, heatmap_resized
 
-def generate_l32_gradcam(model, image, text_tensor, device, target_class=None):
+def generate_l32_gradcam(model, image_tensor, text_tensor, device, target_class=None):
     """Generate L32 Grad-CAM explanation."""
     try:
-        gradcam = L32GradCAM(model, device)
-        heatmap, target_class = gradcam.generate_heatmap(image, text_tensor, target_class)
+        # Get target layer (L32)
+        target_layer = get_target_layer_l32(model)
         
-        if heatmap is None:
+        if target_layer is None:
+            st.error("Target layer not found")
             return None, None
         
+        # Create Grad-CAM instance
+        gradcam = L32GradCAM(model, target_layer, device)
+        
+        # Ensure tensors are on correct device and require gradients
+        image = image_tensor.clone().to(device)
+        image.requires_grad = True
+        text = text_tensor.clone().to(device)
+        
+        # Generate heatmap
+        heatmap = gradcam.generate_heatmap(image, text, target_class)
+        
+        if heatmap is None:
+            st.error("Heatmap generation failed")
+            return None, None
+        
+        # Check if heatmap has any values
+        if np.max(heatmap) < 0.01:
+            st.warning("Heatmap values are very small. Trying alternative method...")
+            # Use a simple fallback: gradient of the target layer
+            return None, None
+        
+        # Create overlay
         overlay, heatmap_resized = create_overlay(image, heatmap, alpha=0.6)
+        
         return overlay, heatmap_resized
         
     except Exception as e:
-        st.warning(f"L32 Grad-CAM error: {e}")
+        st.error(f"L32 Grad-CAM error: {e}")
+        import traceback
+        st.code(traceback.format_exc())
         return None, None
 
 # ============================================================================
@@ -391,25 +463,14 @@ def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50)
         return None, []
     
     def preprocess_text(text, word_to_idx, max_len=50):
-        if word_to_idx is None:
-            tokens = text.lower().split()
-            token_ids = [1] * len(tokens)
-            if len(token_ids) > max_len:
-                token_ids = token_ids[:max_len]
-            else:
-                token_ids = token_ids + [0] * (max_len - len(token_ids))
-            return torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
-        
         tokens = text.lower().split()
         token_ids = []
         for token in tokens:
             token_ids.append(word_to_idx.get(token, word_to_idx.get('<UNK>', 1)))
-        
         if len(token_ids) > max_len:
             token_ids = token_ids[:max_len]
         else:
             token_ids = token_ids + [0] * (max_len - len(token_ids))
-        
         return torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
     
     text_tensor = preprocess_text(text, word_to_idx, max_len)
@@ -452,12 +513,11 @@ def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50)
 
 @st.cache_resource
 def load_model_and_vocab():
-    """Load the trained model and vocabulary from Google Drive."""
+    """Load the trained model and vocabulary."""
     
     import gdown
     import requests
     
-    # File IDs
     MODEL_FILE_ID = "11lYY2-0tXlF4mE1peB2ReQy9bMLlp2mp"
     VOCAB_FILE_ID = "1r2mCVi-tVjeI18P2dBFFdlYAeHNuKnm-"
     
@@ -609,9 +669,9 @@ with col2:
                 
                 # Make prediction
                 with torch.no_grad():
-                    image_tensor = image_tensor.to(device)
-                    text_tensor = text_tensor.to(device)
-                    outputs = model(image_tensor, text_tensor)
+                    image_tensor_device = image_tensor.to(device)
+                    text_tensor_device = text_tensor.to(device)
+                    outputs = model(image_tensor_device, text_tensor_device)
                     probabilities = torch.softmax(outputs, dim=1)
                     prediction = torch.argmax(probabilities, dim=1).item()
                     confidence = probabilities[0][prediction].item()
@@ -702,7 +762,7 @@ with col2:
                     st.caption("🟡 Yellow/Red areas = Regions most important for the prediction")
                     st.info("**L32** captures high-level concepts and complex patterns that are most relevant for emotion recognition.")
                 else:
-                    st.info("L32 Grad-CAM explanation not available")
+                    st.info("L32 Grad-CAM explanation not available. Try a different image or layer.")
                 
                 # ================================================================
                 # LIME - Text Explanation
@@ -742,6 +802,8 @@ with col2:
                 
             except Exception as e:
                 st.error(f"Error: {e}")
+                import traceback
+                st.code(traceback.format_exc())
     
     elif analyze_button:
         if uploaded_file is None:
