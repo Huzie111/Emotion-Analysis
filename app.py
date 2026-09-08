@@ -898,4 +898,51 @@ with col2:
                     
                     if text_input.strip():
                         base_pred, word_importance = generate_lime_text_explanation(
-                            text_input, model
+                            text_input, model, word_to_idx, device, max_len=50
+                        )
+                        
+                        if word_importance and len(word_importance) > 0:
+                            highlighted_words = []
+                            for word, importance in word_importance:
+                                if importance > 0.7:
+                                    cls = "high"
+                                elif importance > 0.4:
+                                    cls = "medium"
+                                else:
+                                    cls = "low"
+                                highlighted_words.append(f'<span class="word-highlight {cls}">{word}</span>')
+                            
+                            st.markdown(
+                                f'<div style="padding: 10px; background: #f8f9fa; border-radius: 8px; font-size: 0.95rem; line-height: 1.8;">'
+                                f'{" ".join(highlighted_words)}'
+                                f'</div>',
+                                unsafe_allow_html=True
+                            )
+                            
+                            st.caption("High importance = Red | Medium = Yellow | Low = Gray")
+                            class_names_expl = ['Happy', 'Sad']
+                            st.caption(f"Text-based prediction: {class_names_expl[base_pred]}")
+                        else:
+                            st.info("LIME explanation not available for this text")
+                    else:
+                        st.info("No text provided for LIME explanation")
+                    
+                except Exception as e:
+                    st.error(f"Error: {e}")
+    
+    elif analyze_button:
+        if uploaded_file is None:
+            st.warning("Please upload a drawing")
+        if not text_input.strip():
+            st.warning("Please enter self-reflection text")
+
+# ============================================================================
+# FOOTER
+# ============================================================================
+
+st.markdown("---")
+st.markdown("""
+<div style="text-align: center; color: #95a5a6; font-size: 0.7rem;">
+    MobileNetV2 + BiLSTM | Multiple Grad-CAM Variants + LIME | 92.69% Val Accuracy | KIDO Dataset
+</div>
+""", unsafe_allow_html=True)
