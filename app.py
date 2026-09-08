@@ -1,7 +1,7 @@
 """
 L32 Layer-Wise Grad-CAM Streamlit App
 Model: MobileNetV2 + BiLSTM (92.69% Validation Accuracy)
-FIXED: Proper model architecture matching training
+Files are downloaded from Google Drive automatically
 """
 
 import streamlit as st
@@ -11,6 +11,8 @@ import torch.nn.functional as F
 import numpy as np
 import os
 import re
+import gdown
+import requests
 from PIL import Image
 from torchvision import transforms, models
 import matplotlib.pyplot as plt
@@ -129,6 +131,90 @@ st.markdown('<div class="main-header">🎨 Emotion Analysis from Children\'s Dra
 st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | Layer-wise Grad-CAM Explainability</div>', unsafe_allow_html=True)
 
 # ============================================================================
+# GOOGLE DRIVE DOWNLOAD FUNCTIONS
+# ============================================================================
+
+# Google Drive File IDs
+MODEL_FILE_ID = "11lYY2-0tXlF4mE1peB2ReQy9bMLlp2mp"
+VOCAB_FILE_ID = "1r2mCVi-tVjeI18P2dBFFdlYAeHNuKnm-"
+
+MODEL_FILE_NAME = "MM_MobileNetV2_BiLSTM_final.pt"
+VOCAB_FILE_NAME = "vocabulary.pth"
+
+def download_file_from_drive(file_id, output_path, description="file"):
+    """
+    Download a file from Google Drive using gdown with fallback to requests.
+    """
+    
+    try:
+        # Try gdown first
+        st.info(f"📥 Downloading {description} from Google Drive...")
+        url = f"https://drive.google.com/uc?id={file_id}"
+        gdown.download(url, output_path, quiet=False)
+        
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            st.success(f"✅ {description} downloaded successfully!")
+            return True
+        return False
+        
+    except Exception as e:
+        st.warning(f"⚠️ gdown failed: {e}")
+        
+        # Try with requests fallback
+        try:
+            url = f"https://drive.google.com/uc?export=download&id={file_id}"
+            session = requests.Session()
+            response = session.get(url, stream=True)
+            
+            # Handle confirmation token
+            if 'confirm' in response.text:
+                confirm_match = re.search(r'confirm=([^&]+)', response.text)
+                if confirm_match:
+                    confirm_token = confirm_match.group(1)
+                    url = f"https://drive.google.com/uc?export=download&confirm={confirm_token}&id={file_id}"
+                    response = session.get(url, stream=True)
+            
+            if response.status_code == 200:
+                with open(output_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                    st.success(f"✅ {description} downloaded successfully!")
+                    return True
+            
+            return False
+            
+        except Exception as e2:
+            st.error(f"❌ Failed to download {description}: {e2}")
+            return False
+
+def check_and_download_files():
+    """Check if files exist, download if missing."""
+    
+    # Check model file
+    if not os.path.exists(MODEL_FILE_NAME):
+        st.info("📥 Model file not found. Downloading from Google Drive...")
+        success = download_file_from_drive(MODEL_FILE_ID, MODEL_FILE_NAME, "model")
+        if not success:
+            st.error("❌ Failed to download model file.")
+            return False
+    else:
+        st.success(f"✅ Model file found: {MODEL_FILE_NAME} ({os.path.getsize(MODEL_FILE_NAME)/1024/1024:.1f} MB)")
+    
+    # Check vocabulary file
+    if not os.path.exists(VOCAB_FILE_NAME):
+        st.info("📥 Vocabulary file not found. Downloading from Google Drive...")
+        success = download_file_from_drive(VOCAB_FILE_ID, VOCAB_FILE_NAME, "vocabulary")
+        if not success:
+            st.error("❌ Failed to download vocabulary file.")
+            return False
+    else:
+        st.success(f"✅ Vocabulary file found: {VOCAB_FILE_NAME} ({os.path.getsize(VOCAB_FILE_NAME)/1024/1024:.1f} MB)")
+    
+    return True
+
+# ============================================================================
 # MODEL COMPONENTS - EXACT MATCH TO TRAINING
 # ============================================================================
 
@@ -147,23 +233,6 @@ class BiLSTMTextEncoder(nn.Module):
         lstm_out, _ = self.lstm(embedded)
         attn_weights = torch.softmax(self.attention(lstm_out), dim=1)
         context = torch.sum(attn_weights * lstm_out, dim=1)
-        return context
-
-class GRUTextEncoder(nn.Module):
-    def __init__(self, vocab_size, embed_dim=300, hidden=128, dropout=0.7):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.gru = nn.GRU(embed_dim, hidden, 2, bidirectional=True, 
-                         batch_first=True, dropout=dropout)
-        self.attention = nn.Linear(hidden * 2, 1)
-        self.dropout = nn.Dropout(dropout)
-        self.output_dim = hidden * 2
-        
-    def forward(self, x):
-        embedded = self.dropout(self.embedding(x))
-        gru_out, _ = self.gru(embedded)
-        attn_weights = torch.softmax(self.attention(gru_out), dim=1)
-        context = torch.sum(attn_weights * gru_out, dim=1)
         return context
 
 def get_vision_encoder(name, pretrained=False):
@@ -255,8 +324,6 @@ def create_text_encoder(text_type, vocab_size, hidden=128):
     """Create text encoder based on type."""
     if text_type == 'bilstm':
         return BiLSTMTextEncoder(vocab_size, hidden=hidden)
-    elif text_type == 'gru':
-        return GRUTextEncoder(vocab_size, hidden=hidden)
     else:
         raise ValueError(f"Unknown text encoder: {text_type}")
 
@@ -266,19 +333,10 @@ def create_text_encoder(text_type, vocab_size, hidden=128):
 
 @st.cache_resource
 def load_model_and_vocab():
-    """Load the trained model and vocabulary."""
+    """Load the trained model and vocabulary from Google Drive."""
     
-    # File paths
-    MODEL_FILE_NAME = "MM_MobileNetV2_BiLSTM_final.pt"
-    VOCAB_FILE_NAME = "vocabulary.pth"
-    
-    # Check if files exist
-    if not os.path.exists(MODEL_FILE_NAME):
-        st.warning(f"Model file not found: {MODEL_FILE_NAME}")
-        return None, None, None
-    
-    if not os.path.exists(VOCAB_FILE_NAME):
-        st.warning(f"Vocabulary file not found: {VOCAB_FILE_NAME}")
+    # Check and download files
+    if not check_and_download_files():
         return None, None, None
     
     try:
@@ -495,10 +553,11 @@ def preprocess_text(text, word_to_idx, max_len=50):
 # ============================================================================
 
 # Load model
-model, word_to_idx, device = load_model_and_vocab()
+with st.spinner("📥 Downloading and loading model... Please wait."):
+    model, word_to_idx, device = load_model_and_vocab()
 
 if model is None:
-    st.error("❌ Failed to load model. Please check your files.")
+    st.error("❌ Failed to load model. Please check your internet connection and try again.")
     st.stop()
 
 # Get all Conv2d layers
@@ -660,10 +719,19 @@ with col2:
                         st.pyplot(fig)
                         plt.close()
                         
+                        # Show heatmap stats
+                        col_a, col_b, col_c = st.columns(3)
+                        with col_a:
+                            st.metric("Max Activation", f"{np.max(heatmap):.3f}")
+                        with col_b:
+                            st.metric("Mean Activation", f"{np.mean(heatmap):.3f}")
+                        with col_c:
+                            st.metric("Std Deviation", f"{np.std(heatmap):.3f}")
+                        
                         st.caption("🟡 Yellow/Red areas = Most important regions for prediction")
                     else:
-                        st.warning(f"Grad-CAM not available for Layer {layer_index}.")
-                        st.info("💡 Try layers: 10, 15, 20, 25, or 32")
+                        st.warning(f"⚠️ Grad-CAM not available for Layer {layer_index}.")
+                        st.info("💡 Try layers: 10, 15, 20, 25, or 32 for better visualizations")
                 else:
                     st.warning(f"Layer {layer_index} not found. Max layer: {len(all_layers)-1}")
                 
