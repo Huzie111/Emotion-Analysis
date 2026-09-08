@@ -309,7 +309,7 @@ def predict(model, image, text_tensor, device):
     return prediction, confidence, probabilities
 
 # ============================================================================
-# LAYER 5 GRAD-CAM (No OpenCV)
+# LAYER 5 GRAD-CAM (FIXED - No .numpy() on tensors with gradients)
 # ============================================================================
 
 class GradCAM:
@@ -325,10 +325,10 @@ class GradCAM:
     
     def _register_hooks(self):
         def forward_hook(module, input, output):
-            self.activations = output
+            self.activations = output.detach()  # Detach to avoid gradient issues
             
         def backward_hook(module, grad_input, grad_output):
-            self.gradients = grad_output[0]
+            self.gradients = grad_output[0].detach()  # Detach to avoid gradient issues
             
         self.target_layer.register_forward_hook(forward_hook)
         self.target_layer.register_backward_hook(backward_hook)
@@ -354,7 +354,7 @@ class GradCAM:
         loss = output[0, target_class]
         loss.backward()
         
-        # Get gradients and activations
+        # Get gradients and activations (already detached)
         gradients = self.gradients
         activations = self.activations
         
@@ -372,7 +372,8 @@ class GradCAM:
         cam = cam - cam.min()
         cam = cam / (cam.max() + 1e-8)
         
-        heatmap = cam.squeeze().cpu().detach().numpy()
+        # Convert to numpy (safe - no gradients)
+        heatmap = cam.squeeze().cpu().numpy()
         
         return heatmap, target_class
 
@@ -401,12 +402,13 @@ def get_layer_5(model):
         st.warning(f"Layer {target_index} not found. Using last layer (index {len(conv_layers)-1}).")
         return conv_layers[-1]
 
-def create_overlay(image, heatmap, alpha=0.5, target_size=(224, 224)):
+def create_overlay(image, heatmap, alpha=0.5):
     """Create heatmap overlay without OpenCV."""
     
     # Convert image to numpy array
     if isinstance(image, torch.Tensor):
-        img = image.squeeze().cpu().numpy()
+        # Detach and convert to numpy
+        img = image.squeeze().detach().cpu().numpy()
         if img.shape[0] == 3:
             img = img.transpose(1, 2, 0)
         # Denormalize
