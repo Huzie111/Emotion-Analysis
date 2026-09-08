@@ -305,11 +305,11 @@ def predict(model, image, text_tensor, device):
     return prediction, confidence, probabilities
 
 # ============================================================================
-# MULTIPLE GRAD-CAM VARIANTS
+# FIXED GRAD-CAM IMPLEMENTATIONS
 # ============================================================================
 
-class GradCAMBase:
-    """Base class for Grad-CAM implementations."""
+class GradCAM:
+    """Original Grad-CAM implementation."""
     
     def __init__(self, model, target_layer, device):
         self.model = model
@@ -321,19 +321,13 @@ class GradCAMBase:
     
     def _register_hooks(self):
         def forward_hook(module, input, output):
-            self.activations = output.detach()
+            self.activations = output
             
         def backward_hook(module, grad_input, grad_output):
-            self.gradients = grad_output[0].detach()
+            self.gradients = grad_output[0]
             
         self.target_layer.register_forward_hook(forward_hook)
         self.target_layer.register_backward_hook(backward_hook)
-    
-    def generate_heatmap(self, image, text_tensor, target_class=None):
-        raise NotImplementedError
-
-class GradCAM(GradCAMBase):
-    """Original Grad-CAM."""
     
     def generate_heatmap(self, image, text_tensor, target_class=None):
         self.model.eval()
@@ -348,6 +342,7 @@ class GradCAM(GradCAMBase):
         if target_class is None:
             target_class = torch.argmax(output, dim=1).item()
         
+        # Zero gradients and backward
         self.model.zero_grad()
         loss = output[0, target_class]
         loss.backward()
@@ -358,18 +353,40 @@ class GradCAM(GradCAMBase):
         if gradients is None or activations is None:
             return None
         
-        weights = gradients.mean(dim=(2, 3), keepdim=True)
-        cam = (weights * activations).sum(dim=1, keepdim=True)
+        # Global average pooling of gradients
+        weights = torch.mean(gradients, dim=(2, 3), keepdim=True)
+        
+        # Weighted combination
+        cam = torch.sum(weights * activations, dim=1, keepdim=True)
         cam = F.relu(cam)
         
-        cam = cam - cam.min()
-        cam = cam / (cam.max() + 1e-8)
+        # Normalize
+        cam = cam - torch.min(cam)
+        cam = cam / (torch.max(cam) + 1e-8)
         
-        heatmap = cam.squeeze().cpu().numpy()
+        heatmap = cam.squeeze().detach().cpu().numpy()
         return heatmap
 
-class GradCAMPlusPlus(GradCAMBase):
-    """Grad-CAM++ (improved version with higher-order derivatives)."""
+class GradCAMPlusPlus:
+    """Grad-CAM++ implementation."""
+    
+    def __init__(self, model, target_layer, device):
+        self.model = model
+        self.target_layer = target_layer
+        self.device = device
+        self.gradients = None
+        self.activations = None
+        self._register_hooks()
+    
+    def _register_hooks(self):
+        def forward_hook(module, input, output):
+            self.activations = output
+            
+        def backward_hook(module, grad_input, grad_output):
+            self.gradients = grad_output[0]
+            
+        self.target_layer.register_forward_hook(forward_hook)
+        self.target_layer.register_backward_hook(backward_hook)
     
     def generate_heatmap(self, image, text_tensor, target_class=None):
         self.model.eval()
@@ -394,29 +411,28 @@ class GradCAMPlusPlus(GradCAMBase):
         if gradients is None or activations is None:
             return None
         
-        # Grad-CAM++ computation with higher-order derivatives
+        # Grad-CAM++ computation
         grad_2 = gradients.pow(2)
         grad_3 = grad_2 * gradients
         
-        # Compute weights using Grad-CAM++ formula
         eps = 1e-8
         alpha_num = grad_2
         alpha_den = 2 * grad_2 + grad_3 * activations + eps
         alpha = alpha_num / alpha_den
         
-        weights = (alpha * F.relu(gradients)).sum(dim=(2, 3), keepdim=True)
+        weights = torch.sum(alpha * F.relu(gradients), dim=(2, 3), keepdim=True)
         
-        cam = (weights * activations).sum(dim=1, keepdim=True)
+        cam = torch.sum(weights * activations, dim=1, keepdim=True)
         cam = F.relu(cam)
         
-        cam = cam - cam.min()
-        cam = cam / (cam.max() + 1e-8)
+        cam = cam - torch.min(cam)
+        cam = cam / (torch.max(cam) + 1e-8)
         
-        heatmap = cam.squeeze().cpu().numpy()
+        heatmap = cam.squeeze().detach().cpu().numpy()
         return heatmap
 
 class ScoreCAM:
-    """Score-CAM (gradient-free method using activation scores)."""
+    """Score-CAM implementation (gradient-free)."""
     
     def __init__(self, model, target_layer, device):
         self.model = model
@@ -427,7 +443,7 @@ class ScoreCAM:
     
     def _register_hooks(self):
         def forward_hook(module, input, output):
-            self.activations = output.detach()
+            self.activations = output
             
         self.target_layer.register_forward_hook(forward_hook)
     
@@ -437,7 +453,7 @@ class ScoreCAM:
         image = image.to(self.device)
         text_tensor = text_tensor.to(self.device)
         
-        # Forward pass to get activations
+        # Forward pass
         output = self.model(image, text_tensor)
         
         if target_class is None:
@@ -454,38 +470,32 @@ class ScoreCAM:
         # Get base prediction score
         base_score = F.softmax(output, dim=1)[0, target_class].item()
         
-        # Compute weights for each activation map
+        # Compute weights
         weights = []
-        for i in range(act_maps.size(0)):
-            # Upsample activation map to input size
+        for i in range(min(act_maps.size(0), 20)):  # Limit to 20 maps for speed
             act_map = act_maps[i:i+1].unsqueeze(0)
             act_map_up = F.interpolate(act_map, size=(224, 224), mode='bilinear', align_corners=False)
-            
-            # Normalize activation map
             act_map_norm = (act_map_up - act_map_up.min()) / (act_map_up.max() - act_map_up.min() + 1e-8)
             
-            # Create masked input
             masked_image = image * act_map_norm
             
-            # Get prediction score with masked input
             with torch.no_grad():
                 masked_output = self.model(masked_image, text_tensor)
                 masked_score = F.softmax(masked_output, dim=1)[0, target_class].item()
             
-            # Weight = score difference
             weight = masked_score - base_score
             weights.append(weight)
         
         weights = torch.tensor(weights, device=self.device).unsqueeze(1).unsqueeze(2)
+        act_maps_limited = act_maps[:len(weights)]
         
-        # Weighted sum of activation maps
-        cam = (weights * act_maps).sum(dim=0, keepdim=True).unsqueeze(0)
+        cam = torch.sum(weights * act_maps_limited, dim=0, keepdim=True).unsqueeze(0)
         cam = F.relu(cam)
         
-        cam = cam - cam.min()
-        cam = cam / (cam.max() + 1e-8)
+        cam = cam - torch.min(cam)
+        cam = cam / (torch.max(cam) + 1e-8)
         
-        heatmap = cam.squeeze().cpu().numpy()
+        heatmap = cam.squeeze().detach().cpu().numpy()
         return heatmap
 
 def get_conv_layers(model):
@@ -501,15 +511,7 @@ def get_conv_layers(model):
     collect_layers(model.vision)
     return conv_layers
 
-def get_layer_by_index(model, layer_index):
-    """Get Conv2d layer by index."""
-    conv_layers = get_conv_layers(model)
-    
-    if layer_index < len(conv_layers):
-        return conv_layers[layer_index]
-    return conv_layers[-1]
-
-def resize_heatmap_pytorch(heatmap, target_size):
+def resize_heatmap(heatmap, target_size):
     """Resize heatmap using PyTorch interpolate."""
     heatmap_tensor = torch.tensor(heatmap, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
     resized = F.interpolate(heatmap_tensor, size=target_size, mode='bilinear', align_corners=False)
@@ -518,6 +520,7 @@ def resize_heatmap_pytorch(heatmap, target_size):
 def create_overlay(image, heatmap, alpha=0.5):
     """Create heatmap overlay."""
     
+    # Convert image to numpy
     if isinstance(image, torch.Tensor):
         img = image.squeeze().detach().cpu().numpy()
         if img.shape[0] == 3:
@@ -533,35 +536,39 @@ def create_overlay(image, heatmap, alpha=0.5):
         elif img.shape[2] == 4:
             img = img[:, :, :3]
     
+    # Resize heatmap
     target_size = (img.shape[0], img.shape[1])
-    heatmap_resized = resize_heatmap_pytorch(heatmap, target_size)
+    heatmap_resized = resize_heatmap(heatmap, target_size)
     heatmap_resized = np.clip(heatmap_resized, 0, 1)
     
+    # Create RGB heatmap
     heatmap_rgb = cm.jet(heatmap_resized)[:, :, :3]
     
+    # Overlay
     overlay = (1 - alpha) * img + alpha * heatmap_rgb
     overlay = np.clip(overlay, 0, 1)
     
     return overlay, heatmap_resized
 
 def generate_gradcam_multiple(model, image, text_tensor, device, target_class=None):
-    """Generate multiple Grad-CAM variants for comparison."""
+    """Generate multiple Grad-CAM variants."""
     
-    # Get Conv2d layers
     conv_layers = get_conv_layers(model)
     num_layers = len(conv_layers)
     
-    # Use different layers for comparison
-    layer_indices = [5, 10, 15, 18]  # Different depths
+    # Use different layers
+    layer_indices = [5, 10, 15]  # Different depths
     layer_indices = [i for i in layer_indices if i < num_layers]
+    
+    if not layer_indices:
+        layer_indices = [0]
     
     results = {}
     
     for layer_idx in layer_indices:
         target_layer = conv_layers[layer_idx]
-        layer_name = f"Layer {layer_idx}"
         
-        # Generate different Grad-CAM variants
+        # Try different Grad-CAM variants
         variants = {
             'Grad-CAM': GradCAM(model, target_layer, device),
             'Grad-CAM++': GradCAMPlusPlus(model, target_layer, device),
@@ -571,17 +578,17 @@ def generate_gradcam_multiple(model, image, text_tensor, device, target_class=No
         for variant_name, cam_instance in variants.items():
             try:
                 heatmap = cam_instance.generate_heatmap(image, text_tensor, target_class)
-                if heatmap is not None:
+                if heatmap is not None and heatmap.max() > 0.01:
                     overlay, heatmap_resized = create_overlay(image, heatmap, alpha=0.6)
-                    key = f"{layer_name} - {variant_name}"
+                    key = f"Layer {layer_idx} - {variant_name}"
                     results[key] = {
                         'heatmap': heatmap_resized,
                         'overlay': overlay,
                         'layer': layer_idx,
-                        'variant': variant_name,
-                        'layer_name': layer_name
+                        'variant': variant_name
                     }
             except Exception as e:
+                st.warning(f"Error with {variant_name} at Layer {layer_idx}: {e}")
                 continue
     
     return results
@@ -660,8 +667,6 @@ st.markdown("""
     .word-highlight.high { background: #dc3545; color: white; }
     .word-highlight.medium { background: #ffc107; color: #333; }
     .word-highlight.low { background: #e9ecef; color: #333; }
-    .gradcam-title { font-size: 1rem; font-weight: 600; color: #2c3e50; margin: 10px 0 5px 0; }
-    .gradcam-info { font-size: 0.7rem; color: #7f8c8d; margin-bottom: 5px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -697,18 +702,6 @@ with st.sidebar:
             <tr><td class="label">Grad-CAM</td><td>Original (gradients)</td></tr>
             <tr><td class="label">Grad-CAM++</td><td>Higher-order derivatives</td></tr>
             <tr><td class="label">Score-CAM</td><td>Gradient-free</td></tr>
-        </table>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown("### Layers")
-    st.markdown("""
-    <div class="model-info">
-        <table>
-            <tr><td class="label">Layer 5</td><td>Early features (edges/colors)</td></tr>
-            <tr><td class="label">Layer 10</td><td>Mid-level features</td></tr>
-            <tr><td class="label">Layer 15</td><td>High-level features</td></tr>
-            <tr><td class="label">Layer 18</td><td>Deep features</td></tr>
         </table>
     </div>
     """, unsafe_allow_html=True)
@@ -750,7 +743,7 @@ with st.sidebar:
             st.error(f"Model error: {e}")
 
 # ============================================================================
-# MAIN CONTENT - TWO COLUMNS
+# MAIN CONTENT
 # ============================================================================
 
 col1, col2 = st.columns([1, 1])
@@ -853,45 +846,27 @@ with col2:
                         st.success("High confidence prediction")
                     
                     # ========================================================
-                    # MULTIPLE GRAD-CAM VARIANTS
+                    # GRAD-CAM
                     # ========================================================
                     st.markdown("---")
                     st.markdown("### Grad-CAM Visual Explanations")
-                    st.caption("Compare different Grad-CAM variants across layers")
                     
-                    # Generate all Grad-CAM variants
                     all_results = generate_gradcam_multiple(
                         model, image_tensor, text_tensor, device, target_class=prediction
                     )
                     
                     if all_results:
-                        # Group results by layer
-                        layer_groups = {}
-                        for key, result in all_results.items():
-                            layer = result['layer']
-                            if layer not in layer_groups:
-                                layer_groups[layer] = []
-                            layer_groups[layer].append(result)
-                        
-                        # Sort layers
-                        for layer in sorted(layer_groups.keys()):
-                            layer_name = f"Layer {layer}"
-                            st.markdown(f"#### {layer_name}")
-                            
-                            # Get 3 variants for this layer
-                            variants = layer_groups[layer]
-                            
-                            # Create grid for this layer
-                            cols = st.columns(len(variants))
-                            
-                            for idx, (col, variant) in enumerate(zip(cols, variants)):
-                                with col:
-                                    st.image(variant['heatmap'], caption=f"{variant['variant']}", use_container_width=True)
+                        # Display results in a grid
+                        cols = st.columns(min(len(all_results), 3))
+                        for idx, (key, result) in enumerate(all_results.items()):
+                            col_idx = idx % 3
+                            with cols[col_idx]:
+                                st.image(result['overlay'], caption=key, use_container_width=True)
                     else:
-                        st.info("No Grad-CAM explanations available")
+                        st.info("Grad-CAM explanations not available")
                     
                     # ========================================================
-                    # LIME FOR TEXT
+                    # LIME
                     # ========================================================
                     st.markdown("---")
                     st.markdown("### LIME: Text Explanation")
@@ -923,9 +898,9 @@ with col2:
                             class_names_expl = ['Happy', 'Sad']
                             st.caption(f"Text-based prediction: {class_names_expl[base_pred]}")
                         else:
-                            st.info("LIME explanation not available for this text")
+                            st.info("LIME explanation not available")
                     else:
-                        st.info("No text provided for LIME explanation")
+                        st.info("No text provided")
                     
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -943,6 +918,6 @@ with col2:
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #95a5a6; font-size: 0.7rem;">
-    MobileNetV2 + BiLSTM | Multiple Grad-CAM Variants + LIME | 92.69% Val Accuracy | KIDO Dataset
+    MobileNetV2 + BiLSTM | Multiple Grad-CAM Variants + LIME | 92.69% Val Accuracy
 </div>
 """, unsafe_allow_html=True)
