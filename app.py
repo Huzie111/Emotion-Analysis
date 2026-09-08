@@ -1,8 +1,7 @@
 """
 L32 Layer-Wise Grad-CAM Streamlit App
 Model: MobileNetV2 + BiLSTM (92.69% Validation Accuracy)
-Select any Conv2d layer for Grad-CAM visualization
-FIXED: Proper gradient propagation for all layers
+FIXED: Proper model architecture matching training
 """
 
 import streamlit as st
@@ -119,13 +118,6 @@ st.markdown("""
         background: #e9ecef;
         color: #333;
     }
-    .layer-selector {
-        background: #f8f9fa;
-        padding: 15px;
-        border-radius: 8px;
-        border: 1px solid #e9ecef;
-        margin: 10px 0;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -137,7 +129,7 @@ st.markdown('<div class="main-header">🎨 Emotion Analysis from Children\'s Dra
 st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | Layer-wise Grad-CAM Explainability</div>', unsafe_allow_html=True)
 
 # ============================================================================
-# MODEL COMPONENTS
+# MODEL COMPONENTS - EXACT MATCH TO TRAINING
 # ============================================================================
 
 class BiLSTMTextEncoder(nn.Module):
@@ -157,11 +149,31 @@ class BiLSTMTextEncoder(nn.Module):
         context = torch.sum(attn_weights * lstm_out, dim=1)
         return context
 
+class GRUTextEncoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim=300, hidden=128, dropout=0.7):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.gru = nn.GRU(embed_dim, hidden, 2, bidirectional=True, 
+                         batch_first=True, dropout=dropout)
+        self.attention = nn.Linear(hidden * 2, 1)
+        self.dropout = nn.Dropout(dropout)
+        self.output_dim = hidden * 2
+        
+    def forward(self, x):
+        embedded = self.dropout(self.embedding(x))
+        gru_out, _ = self.gru(embedded)
+        attn_weights = torch.softmax(self.attention(gru_out), dim=1)
+        context = torch.sum(attn_weights * gru_out, dim=1)
+        return context
+
 def get_vision_encoder(name, pretrained=False):
+    """Get vision encoder - matches training architecture exactly."""
+    
     backbones = {
         'mobilenet_v2': (models.mobilenet_v2, 1280),
         'efficientnet_b0': (models.efficientnet_b0, 1280),
         'shufflenet_v2_x1_0': (models.shufflenet_v2_x1_0, 1024),
+        'squeezenet1_1': (models.squeezenet1_1, 512),
     }
     
     if name not in backbones:
@@ -170,18 +182,26 @@ def get_vision_encoder(name, pretrained=False):
     model_fn, dim = backbones[name]
     model = model_fn(pretrained=pretrained)
     
+    # Remove classification head
     if hasattr(model, 'classifier'):
         model.classifier = nn.Identity()
     elif hasattr(model, 'fc'):
         model.fc = nn.Identity()
+    elif hasattr(model, 'head'):
+        model.head = nn.Identity()
     
     return model, dim
 
 class MultimodalModel(nn.Module):
+    """Multimodal model - EXACT match to training."""
+    
     def __init__(self, vision_name, text_encoder, dropout=0.7):
         super().__init__()
         
+        # Vision encoder
         self.vision, vdim = get_vision_encoder(vision_name, pretrained=False)
+        
+        # Vision projection
         self.vision_proj = nn.Sequential(
             nn.Linear(vdim, 512),
             nn.BatchNorm1d(512),
@@ -189,7 +209,10 @@ class MultimodalModel(nn.Module):
             nn.Dropout(dropout)
         )
         
+        # Text encoder
         self.text_encoder = text_encoder
+        
+        # Text projection
         self.text_proj = nn.Sequential(
             nn.Linear(text_encoder.output_dim, 256),
             nn.BatchNorm1d(256),
@@ -197,6 +220,7 @@ class MultimodalModel(nn.Module):
             nn.Dropout(dropout)
         )
         
+        # Fusion + Classifier
         fusion_dim = 512 + 256
         self.classifier = nn.Sequential(
             nn.Linear(fusion_dim, 256),
@@ -211,42 +235,120 @@ class MultimodalModel(nn.Module):
         )
         
     def forward(self, images, texts):
+        # Vision path
         v = self.vision(images)
         if v.dim() > 2:
             v = v.view(v.size(0), -1)
         v = self.vision_proj(v)
         
+        # Text path
         t = self.text_encoder(texts)
         t = self.text_proj(t)
         
+        # Fusion
         fused = torch.cat([v, t], dim=1)
+        
+        # Classification
         return self.classifier(fused)
 
 def create_text_encoder(text_type, vocab_size, hidden=128):
+    """Create text encoder based on type."""
     if text_type == 'bilstm':
         return BiLSTMTextEncoder(vocab_size, hidden=hidden)
+    elif text_type == 'gru':
+        return GRUTextEncoder(vocab_size, hidden=hidden)
     else:
         raise ValueError(f"Unknown text encoder: {text_type}")
 
 # ============================================================================
-# GRAD-CAM IMPLEMENTATION - FIXED
+# LOAD MODEL AND VOCABULARY
+# ============================================================================
+
+@st.cache_resource
+def load_model_and_vocab():
+    """Load the trained model and vocabulary."""
+    
+    # File paths
+    MODEL_FILE_NAME = "MM_MobileNetV2_BiLSTM_final.pt"
+    VOCAB_FILE_NAME = "vocabulary.pth"
+    
+    # Check if files exist
+    if not os.path.exists(MODEL_FILE_NAME):
+        st.warning(f"Model file not found: {MODEL_FILE_NAME}")
+        return None, None, None
+    
+    if not os.path.exists(VOCAB_FILE_NAME):
+        st.warning(f"Vocabulary file not found: {VOCAB_FILE_NAME}")
+        return None, None, None
+    
+    try:
+        # Load vocabulary
+        vocab_data = torch.load(VOCAB_FILE_NAME, map_location='cpu')
+        if isinstance(vocab_data, dict):
+            word_to_idx = vocab_data.get('word_to_idx', vocab_data)
+        else:
+            word_to_idx = vocab_data
+        vocab_size = len(word_to_idx)
+        st.success("✅ Vocabulary loaded successfully!")
+    except Exception as e:
+        st.error(f"Failed to load vocabulary: {e}")
+        return None, None, None
+    
+    try:
+        # Device
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Create text encoder
+        text_enc = create_text_encoder('bilstm', vocab_size, hidden=128)
+        
+        # Create model
+        model = MultimodalModel('mobilenet_v2', text_enc)
+        
+        # Load checkpoint
+        checkpoint = torch.load(MODEL_FILE_NAME, map_location=device)
+        
+        # Handle different checkpoint formats
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+        
+        # Load state dict with strict=False to handle any minor mismatches
+        model.load_state_dict(state_dict, strict=False)
+        
+        model.to(device)
+        model.eval()
+        
+        st.success("✅ Model loaded successfully!")
+        return model, word_to_idx, device
+        
+    except Exception as e:
+        st.error(f"Failed to load model: {e}")
+        import traceback
+        with st.expander("Show full error"):
+            st.code(traceback.format_exc())
+        return None, None, None
+
+# ============================================================================
+# GRAD-CAM IMPLEMENTATION
 # ============================================================================
 
 def get_all_conv_layers(model):
-    """Get all Conv2d layers from the vision encoder with their indices."""
+    """Get all Conv2d layers from the vision encoder."""
     conv_layers = []
     
     def collect_layers(module, prefix=""):
         for name, child in module.named_children():
+            current_name = f"{prefix}.{name}" if prefix else name
             if isinstance(child, nn.Conv2d):
-                conv_layers.append((f"{prefix}{name}", child))
-            collect_layers(child, f"{prefix}{name}.")
+                conv_layers.append((current_name, child))
+            collect_layers(child, current_name)
     
     collect_layers(model.vision)
     return conv_layers
 
 class GradCAM:
-    """Grad-CAM implementation with proper gradient handling."""
+    """Grad-CAM implementation."""
     
     def __init__(self, model, target_layer, device):
         self.model = model
@@ -258,7 +360,6 @@ class GradCAM:
     
     def _register_hooks(self):
         def forward_hook(module, input, output):
-            # Detach to avoid creating cycles, but keep for backward
             self.activations = output
             
         def backward_hook(module, grad_input, grad_output):
@@ -272,7 +373,6 @@ class GradCAM:
         self.model.eval()
         self.model.zero_grad()
         
-        # Clear stored values
         self.gradients = None
         self.activations = None
         
@@ -290,18 +390,16 @@ class GradCAM:
         loss = output[0, target_class]
         loss.backward()
         
-        # Get stored values
         gradients = self.gradients
         activations = self.activations
         
         if gradients is None or activations is None:
-            return None, None, None
+            return None
         
-        # Check if gradients are meaningful
         if torch.max(torch.abs(gradients)) < 1e-6:
-            return None, None, None
+            return None
         
-        # Global average pooling of gradients
+        # Global average pooling
         weights = torch.mean(gradients, dim=(2, 3), keepdim=True)
         
         # Weighted combination
@@ -316,11 +414,10 @@ class GradCAM:
         else:
             cam = torch.zeros_like(cam)
         
-        heatmap = cam.squeeze().detach().cpu().numpy()
-        return heatmap, target_class, loss.item()
+        return cam.squeeze().detach().cpu().numpy()
 
 def resize_heatmap(heatmap, target_size):
-    """Resize heatmap using PyTorch interpolate."""
+    """Resize heatmap."""
     heatmap_tensor = torch.tensor(heatmap, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
     resized = F.interpolate(heatmap_tensor, size=target_size, mode='bilinear', align_corners=False)
     return resized.squeeze().cpu().numpy()
@@ -333,24 +430,19 @@ def create_overlay(image, heatmap, alpha=0.6):
         img = image.squeeze().detach().cpu().numpy()
         if img.shape[0] == 3:
             img = img.transpose(1, 2, 0)
-        # Denormalize
         mean = np.array([0.485, 0.456, 0.406])
         std = np.array([0.229, 0.224, 0.225])
         img = img * std + mean
         img = np.clip(img, 0, 1)
     else:
         img = np.array(image) / 255.0
-        if len(img.shape) == 2:
-            img = np.stack([img, img, img], axis=2)
-        elif img.shape[2] == 4:
-            img = img[:, :, :3]
     
     # Resize heatmap
     target_size = (img.shape[0], img.shape[1])
     heatmap_resized = resize_heatmap(heatmap, target_size)
     heatmap_resized = np.clip(heatmap_resized, 0, 1)
     
-    # Create RGB heatmap
+    # RGB heatmap
     heatmap_rgb = cm.jet(heatmap_resized)[:, :, :3]
     
     # Overlay
@@ -360,130 +452,43 @@ def create_overlay(image, heatmap, alpha=0.6):
     return overlay, heatmap_resized
 
 def generate_gradcam_for_layer(model, layer, image_tensor, text_tensor, device, target_class=None):
-    """Generate Grad-CAM for a specific layer with proper error handling."""
+    """Generate Grad-CAM for a specific layer."""
     try:
         gradcam = GradCAM(model, layer, device)
-        heatmap, target_class, loss_value = gradcam.generate_heatmap(image_tensor, text_tensor, target_class)
+        heatmap = gradcam.generate_heatmap(image_tensor, text_tensor, target_class)
         
-        if heatmap is None:
-            return None, None, None
-        
-        if np.max(heatmap) < 0.01:
-            return None, None, None
+        if heatmap is None or np.max(heatmap) < 0.01:
+            return None, None
         
         overlay, heatmap_resized = create_overlay(image_tensor, heatmap, alpha=0.6)
-        return overlay, heatmap_resized, target_class
+        return overlay, heatmap_resized
         
     except Exception as e:
-        return None, None, None
+        return None, None
 
 # ============================================================================
-# LIME FOR TEXT EXPLANATION
+# TEXT PREPROCESSING
 # ============================================================================
 
-def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50):
-    words = text.lower().split()
-    if len(words) == 0:
-        return None, []
-    
-    def preprocess_text(text, word_to_idx, max_len=50):
-        tokens = text.lower().split()
-        token_ids = []
-        for token in tokens:
-            token_ids.append(word_to_idx.get(token, word_to_idx.get('<UNK>', 1)))
-        if len(token_ids) > max_len:
-            token_ids = token_ids[:max_len]
-        else:
-            token_ids = token_ids + [0] * (max_len - len(token_ids))
-        return torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
-    
-    text_tensor = preprocess_text(text, word_to_idx, max_len)
-    text_tensor = text_tensor.to(device)
-    dummy_image = torch.zeros(1, 3, 224, 224).to(device)
-    
-    with torch.no_grad():
-        outputs = model(dummy_image, text_tensor)
-        base_probs = torch.softmax(outputs, dim=1).cpu().numpy()[0]
-        base_pred = np.argmax(base_probs)
-    
-    word_importance = []
-    for i, word in enumerate(words):
-        perturbed_words = words[:i] + words[i+1:]
-        perturbed_text = ' '.join(perturbed_words)
-        
-        if len(perturbed_text.strip()) == 0:
-            continue
-        
-        perturbed_tensor = preprocess_text(perturbed_text, word_to_idx, max_len)
-        perturbed_tensor = perturbed_tensor.to(device)
-        
-        with torch.no_grad():
-            perturbed_outputs = model(dummy_image, perturbed_tensor)
-            perturbed_probs = torch.softmax(perturbed_outputs, dim=1).cpu().numpy()[0]
-        
-        importance = abs(base_probs[base_pred] - perturbed_probs[base_pred])
-        word_importance.append((word, importance))
-    
-    if len(word_importance) > 0:
-        max_imp = max([imp for _, imp in word_importance])
-        if max_imp > 0:
-            word_importance = [(w, imp / max_imp) for w, imp in word_importance]
-    
-    return base_pred, word_importance
+def preprocess_image(img):
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                           std=[0.229, 0.224, 0.225])
+    ])
+    return transform(img).unsqueeze(0)
 
-# ============================================================================
-# LOAD MODEL AND VOCABULARY
-# ============================================================================
-
-@st.cache_resource
-def load_model_and_vocab():
-    """Load the trained model and vocabulary."""
-    
-    # Update these paths to match your local environment
-    MODEL_FILE_NAME = "MM_MobileNetV2_BiLSTM_final.pt"
-    VOCAB_FILE_NAME = "vocabulary.pth"
-    
-    # Check if files exist locally
-    if not os.path.exists(MODEL_FILE_NAME):
-        st.warning(f"Model file not found: {MODEL_FILE_NAME}. Please ensure the file is in the same directory.")
-        return None, None, None
-    
-    if not os.path.exists(VOCAB_FILE_NAME):
-        st.warning(f"Vocabulary file not found: {VOCAB_FILE_NAME}. Please ensure the file is in the same directory.")
-        return None, None, None
-    
-    # Load vocabulary
-    try:
-        vocab_data = torch.load(VOCAB_FILE_NAME, map_location='cpu')
-        if isinstance(vocab_data, dict):
-            word_to_idx = vocab_data.get('word_to_idx', vocab_data)
-        else:
-            word_to_idx = vocab_data
-        vocab_size = len(word_to_idx)
-        st.success("✅ Vocabulary loaded successfully!")
-    except Exception as e:
-        st.error(f"Failed to load vocabulary: {e}")
-        return None, None, None
-    
-    # Load model
-    try:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        text_enc = create_text_encoder('bilstm', vocab_size, hidden=128)
-        model = MultimodalModel('mobilenet_v2', text_enc)
-        
-        checkpoint = torch.load(MODEL_FILE_NAME, map_location=device)
-        state_dict = checkpoint.get('model_state_dict', checkpoint)
-        model.load_state_dict(state_dict)
-        
-        model.to(device)
-        model.eval()
-        
-        st.success("✅ Model loaded successfully!")
-        return model, word_to_idx, device
-        
-    except Exception as e:
-        st.error(f"Failed to load model: {e}")
-        return None, None, None
+def preprocess_text(text, word_to_idx, max_len=50):
+    tokens = text.lower().split()
+    token_ids = []
+    for token in tokens:
+        token_ids.append(word_to_idx.get(token, word_to_idx.get('<UNK>', 1)))
+    if len(token_ids) > max_len:
+        token_ids = token_ids[:max_len]
+    else:
+        token_ids = token_ids + [0] * (max_len - len(token_ids))
+    return torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
 
 # ============================================================================
 # MAIN APPLICATION
@@ -498,12 +503,10 @@ if model is None:
 
 # Get all Conv2d layers
 all_layers = get_all_conv_layers(model)
-layer_names = [f"Layer {i} - {name}" for i, (name, _) in enumerate(all_layers)]
-
 st.info(f"Found {len(all_layers)} Conv2d layers in vision encoder")
 
 # ============================================================================
-# LAYOUT - TWO COLUMNS
+# LAYOUT
 # ============================================================================
 
 col1, col2 = st.columns([1, 1])
@@ -527,7 +530,7 @@ with col1:
     st.subheader("✍️ Self-Reflection Text")
     
     text_input = st.text_area(
-        "Enter the child's self-reflection about their drawing:",
+        "Enter the child's self-reflection:",
         placeholder="Example: I drew this because I felt very happy today...",
         height=100,
         label_visibility="collapsed"
@@ -538,70 +541,29 @@ with col1:
     # Layer selector
     st.subheader("🎯 Select Grad-CAM Layer")
     
-    # Preset layer suggestions with descriptions
+    # Preset layers
     st.markdown("**Preset Layers:**")
     preset_cols = st.columns(5)
-    preset_layers = {
-        "Layer 5": 5,
-        "Layer 10": 10,
-        "Layer 15": 15,
-        "Layer 20": 20,
-        "Layer 32": 32
-    }
+    preset_layers = {5: "Layer 5", 10: "Layer 10", 15: "Layer 15", 20: "Layer 20", 32: "Layer 32"}
     
     selected_preset = None
-    for col, (name, idx) in zip(preset_cols, preset_layers.items()):
+    for col, (idx, name) in zip(preset_cols, preset_layers.items()):
         if col.button(name, key=f"preset_{idx}", use_container_width=True):
             selected_preset = idx
     
     # Manual selection
     st.markdown("**Or select manually:**")
-    
-    # Create options with descriptions
-    layer_options = []
-    for i, (name, _) in enumerate(all_layers):
-        if i == 5:
-            desc = "Early - edges & textures"
-        elif i == 10:
-            desc = "Basic patterns"
-        elif i == 15:
-            desc = "Mid-level features"
-        elif i == 20:
-            desc = "Complex patterns"
-        elif i == 25:
-            desc = "Higher-level concepts"
-        elif i == 32:
-            desc = "Emotion-relevant (L32)"
-        else:
-            desc = f"Layer {i}"
-        layer_options.append(f"{i}: {desc}")
-    
+    layer_options = [f"Layer {i} - {name[:30]}" for i, (name, _) in enumerate(all_layers)]
     selected_index = st.selectbox(
         "Select layer index",
         options=list(range(len(all_layers))),
-        format_func=lambda x: layer_options[x],
-        index=32 if len(all_layers) > 32 else 5 if len(all_layers) > 5 else 0,
+        format_func=lambda x: layer_options[x] if x < len(layer_options) else f"Layer {x}",
+        index=32 if len(all_layers) > 32 else 0,
         label_visibility="collapsed"
     )
     
-    # Use preset if selected, otherwise use manual selection
     layer_index = selected_preset if selected_preset is not None else selected_index
-    
-    # Show layer info
-    layer_name = all_layers[layer_index][0]
-    st.caption(f"Selected: **Layer {layer_index}** - `{layer_name}`")
-    
-    # Layer description
-    layer_descriptions = {
-        5: "🌿 Early layer: Detects edges, colors, and basic textures",
-        10: "🔶 Mid-layer: Detects simple shapes and patterns",
-        15: "🔷 Mid-layer: Detects object parts and structures",
-        20: "🧩 Late-mid layer: Detects complex shapes",
-        25: "🧠 Late layer: Detects high-level concepts",
-        32: "🎯 L32 (Late): Detects emotion-relevant regions and semantic features"
-    }
-    if layer_index in layer_descriptions:
-        st.info(layer_descriptions[layer_index])
+    st.caption(f"Selected: **Layer {layer_index}**")
 
 with col2:
     st.subheader("📊 Analysis Results")
@@ -611,31 +573,11 @@ with col2:
     if analyze_button and uploaded_file is not None and text_input.strip():
         with st.spinner("Analyzing..."):
             try:
-                # Preprocess inputs
-                def preprocess_image(img):
-                    transform = transforms.Compose([
-                        transforms.Resize((224, 224)),
-                        transforms.ToTensor(),
-                        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                                           std=[0.229, 0.224, 0.225])
-                    ])
-                    return transform(img).unsqueeze(0)
-                
-                def preprocess_text(text, word_to_idx, max_len=50):
-                    tokens = text.lower().split()
-                    token_ids = []
-                    for token in tokens:
-                        token_ids.append(word_to_idx.get(token, word_to_idx.get('<UNK>', 1)))
-                    if len(token_ids) > max_len:
-                        token_ids = token_ids[:max_len]
-                    else:
-                        token_ids = token_ids + [0] * (max_len - len(token_ids))
-                    return torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
-                
+                # Preprocess
                 image_tensor = preprocess_image(image)
                 text_tensor = preprocess_text(text_input, word_to_idx, max_len=50)
                 
-                # Make prediction
+                # Predict
                 with torch.no_grad():
                     image_tensor_device = image_tensor.to(device)
                     text_tensor_device = text_tensor.to(device)
@@ -646,8 +588,6 @@ with col2:
                 
                 class_names = ['Happy', 'Sad']
                 predicted_class = class_names[prediction]
-                
-                confidence_pct = confidence * 100
                 happy_pct = probabilities[0][0].item() * 100
                 sad_pct = probabilities[0][1].item() * 100
                 
@@ -656,14 +596,14 @@ with col2:
                     st.markdown(f"""
                     <div class="result-box happy">
                         <h2 style="margin: 0;">😊 Happy</h2>
-                        <p style="font-size: 1.2rem; margin: 0;">Confidence: {confidence_pct:.1f}%</p>
+                        <p style="font-size: 1.2rem; margin: 0;">Confidence: {confidence*100:.1f}%</p>
                     </div>
                     """, unsafe_allow_html=True)
                 else:
                     st.markdown(f"""
                     <div class="result-box sad">
                         <h2 style="margin: 0;">😢 Sad</h2>
-                        <p style="font-size: 1.2rem; margin: 0;">Confidence: {confidence_pct:.1f}%</p>
+                        <p style="font-size: 1.2rem; margin: 0;">Confidence: {confidence*100:.1f}%</p>
                     </div>
                     """, unsafe_allow_html=True)
                 
@@ -689,103 +629,43 @@ with col2:
                     </div>
                     """, unsafe_allow_html=True)
                 
-                if confidence_pct < 85:
-                    st.warning("⚠️ Low confidence - Manual review recommended")
-                else:
-                    st.success("✅ High confidence prediction")
-                
-                # ================================================================
-                # GRAD-CAM FOR SELECTED LAYER - FIXED
-                # ================================================================
+                # ============================================================
+                # GRAD-CAM
+                # ============================================================
                 st.markdown("---")
                 st.markdown(f"### 🔍 Grad-CAM - Layer {layer_index}")
-                st.caption(f"Layer: {all_layers[layer_index][0]}")
                 
-                target_layer = all_layers[layer_index][1]
-                
-                # Try multiple times with different settings
-                overlay, heatmap, target_class = generate_gradcam_for_layer(
-                    model, target_layer, image_tensor, text_tensor, device, target_class=prediction
-                )
-                
-                if overlay is not None and heatmap is not None:
-                    fig, axes = plt.subplots(1, 3, figsize=(9, 3))
-                    
-                    # Original image
-                    axes[0].imshow(image.resize((224, 224)))
-                    axes[0].set_title("Original Drawing")
-                    axes[0].axis('off')
-                    
-                    # Heatmap only
-                    axes[1].imshow(heatmap, cmap='jet')
-                    axes[1].set_title(f"Layer {layer_index} Heatmap")
-                    axes[1].axis('off')
-                    
-                    # Overlay
-                    axes[2].imshow(overlay)
-                    axes[2].set_title(f"Layer {layer_index} Overlay")
-                    axes[2].axis('off')
-                    
-                    plt.tight_layout()
-                    st.pyplot(fig)
-                    plt.close()
-                    
-                    st.caption("🟡 Yellow/Red areas = Regions most important for the prediction")
-                    
-                    # Show heatmap statistics
-                    col_a, col_b, col_c = st.columns(3)
-                    with col_a:
-                        st.metric("Max Activation", f"{np.max(heatmap):.3f}")
-                    with col_b:
-                        st.metric("Mean Activation", f"{np.mean(heatmap):.3f}")
-                    with col_c:
-                        st.metric("Activation Std", f"{np.std(heatmap):.3f}")
-                    
-                else:
-                    st.warning(f"⚠️ Grad-CAM not available for Layer {layer_index}.")
-                    st.info("💡 Try these layers that typically work well:")
-                    st.markdown("""
-                    - **Layer 10** - Basic pattern detection
-                    - **Layer 15** - Mid-level feature detection  
-                    - **Layer 20** - Complex pattern detection
-                    - **Layer 32** - Emotion-relevant region detection (L32)
-                    """)
-                
-                # ================================================================
-                # LIME - Text Explanation
-                # ================================================================
-                st.markdown("### 📝 LIME: Text Explanation")
-                
-                if text_input.strip():
-                    base_pred, word_importance = generate_lime_text_explanation(
-                        text_input, model, word_to_idx, device, max_len=50
+                if layer_index < len(all_layers):
+                    target_layer = all_layers[layer_index][1]
+                    overlay, heatmap = generate_gradcam_for_layer(
+                        model, target_layer, image_tensor, text_tensor, device, target_class=prediction
                     )
                     
-                    if word_importance and len(word_importance) > 0:
-                        highlighted_words = []
-                        for word, importance in word_importance:
-                            if importance > 0.7:
-                                cls = "high"
-                            elif importance > 0.4:
-                                cls = "medium"
-                            else:
-                                cls = "low"
-                            highlighted_words.append(f'<span class="word-highlight {cls}">{word}</span>')
+                    if overlay is not None and heatmap is not None:
+                        fig, axes = plt.subplots(1, 3, figsize=(9, 3))
                         
-                        st.markdown(
-                            f'<div style="padding: 10px; background: #f8f9fa; border-radius: 8px; font-size: 0.95rem; line-height: 1.8;">'
-                            f'{" ".join(highlighted_words)}'
-                            f'</div>',
-                            unsafe_allow_html=True
-                        )
+                        axes[0].imshow(image.resize((224, 224)))
+                        axes[0].set_title("Original")
+                        axes[0].axis('off')
                         
-                        st.caption("🔴 High importance | 🟡 Medium | ⚪ Low")
-                        class_names_expl = ['Happy', 'Sad']
-                        st.caption(f"Text-based prediction: {class_names_expl[base_pred]}")
+                        axes[1].imshow(heatmap, cmap='jet')
+                        axes[1].set_title(f"Layer {layer_index} Heatmap")
+                        axes[1].axis('off')
+                        
+                        axes[2].imshow(overlay)
+                        axes[2].set_title(f"Layer {layer_index} Overlay")
+                        axes[2].axis('off')
+                        
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                        plt.close()
+                        
+                        st.caption("🟡 Yellow/Red areas = Most important regions for prediction")
                     else:
-                        st.info("LIME explanation not available for this text")
+                        st.warning(f"Grad-CAM not available for Layer {layer_index}.")
+                        st.info("💡 Try layers: 10, 15, 20, 25, or 32")
                 else:
-                    st.info("No text provided for LIME explanation")
+                    st.warning(f"Layer {layer_index} not found. Max layer: {len(all_layers)-1}")
                 
             except Exception as e:
                 st.error(f"Error: {e}")
@@ -806,6 +686,6 @@ with col2:
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #95a5a6; font-size: 0.7rem;">
-    MobileNetV2 + BiLSTM | Layer-wise Grad-CAM | 92.69% Val Accuracy | KIDO Dataset
+    MobileNetV2 + BiLSTM | Layer-wise Grad-CAM | 92.69% Val Accuracy
 </div>
 """, unsafe_allow_html=True)
