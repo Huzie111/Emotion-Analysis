@@ -2,15 +2,17 @@
 Multimodal Emotion Classification System
 Deployed on Streamlit Cloud
 Model: MobileNetV2 + BiLSTM (92.69% Validation Accuracy)
-Explainability: L32 Grad-CAM (Layer 32) for Visual + LIME for Text
+Explainability: Layer 5 Grad-CAM for Visual + LIME for Text
 """
 
 import streamlit as st
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import models, transforms
 from PIL import Image
 import numpy as np
+import cv2
 import gdown
 import os
 import requests
@@ -20,7 +22,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ============================================================================
-# GOOGLE DRIVE FILE IDs - CONFIRMED
+# GOOGLE DRIVE FILE IDs
 # ============================================================================
 
 MODEL_FILE_ID = "11lYY2-0tXlF4mE1peB2ReQy9bMLlp2mp"
@@ -30,7 +32,7 @@ MODEL_FILE_NAME = "MM_MobileNetV2_BiLSTM_final.pt"
 VOCAB_FILE_NAME = "vocabulary.pth"
 
 # ============================================================================
-# MODEL DEFINITIONS - MATCHING THE SAVED ARCHITECTURE
+# MODEL DEFINITIONS
 # ============================================================================
 
 class BiLSTMTextEncoder(nn.Module):
@@ -51,18 +53,13 @@ class BiLSTMTextEncoder(nn.Module):
         return context
 
 def get_mobilenetv2_encoder(pretrained=False):
-    """Get MobileNetV2 with proper wrapper that matches saved architecture."""
-    
-    # Load the full MobileNetV2 model
+    """Get MobileNetV2 encoder matching saved architecture."""
     model = models.mobilenet_v2(pretrained=pretrained)
     
-    # Define a wrapper that preserves the original structure
     class MobileNetV2Encoder(nn.Module):
         def __init__(self, base_model):
             super().__init__()
-            # Keep the entire features module as is
             self.features = base_model.features
-            # Add pooling
             self.pool = nn.AdaptiveAvgPool2d((1, 1))
             self.feature_dim = 1280
             
@@ -75,8 +72,6 @@ def get_mobilenetv2_encoder(pretrained=False):
     return MobileNetV2Encoder(model), 1280
 
 def get_vision_encoder(name, pretrained=False):
-    """Get vision encoder with proper architecture matching saved model."""
-    
     if name == 'mobilenet_v2':
         return get_mobilenetv2_encoder(pretrained)
     
@@ -88,12 +83,10 @@ def get_vision_encoder(name, pretrained=False):
     if name in backbones:
         model_fn, dim = backbones[name]
         model = model_fn(pretrained=pretrained)
-        
         if hasattr(model, 'classifier'):
             model.classifier = nn.Identity()
         elif hasattr(model, 'fc'):
             model.fc = nn.Identity()
-        
         return model, dim
     
     raise ValueError(f"Unknown model: {name}")
@@ -243,11 +236,11 @@ def load_model(vocab_size):
             if not success:
                 return None, device
         
-        # Create model with proper architecture
+        # Create model
         text_enc = create_text_encoder('bilstm', vocab_size, hidden=128)
         model = MultimodalModel('mobilenet_v2', text_enc)
         
-        # Load weights with strict=False to handle any minor mismatches
+        # Load weights
         checkpoint = torch.load(MODEL_FILE_NAME, map_location=device)
         
         if 'model_state_dict' in checkpoint:
@@ -255,13 +248,8 @@ def load_model(vocab_size):
         else:
             state_dict = checkpoint
         
-        # Try loading with strict=False to ignore missing keys
-        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-        
-        if missing_keys:
-            st.warning(f"Missing keys: {len(missing_keys)} keys")
-        if unexpected_keys:
-            st.warning(f"Unexpected keys: {len(unexpected_keys)} keys")
+        # Load with strict=False to handle any mismatches
+        model.load_state_dict(state_dict, strict=False)
         
         model.to(device)
         model.eval()
@@ -288,7 +276,7 @@ def preprocess_image(image):
         return image_transform(image).unsqueeze(0)
     return image
 
-def tokenize_text(text, word_to_idx, max_len=50):
+def preprocess_text(text, word_to_idx, max_len=50):
     if word_to_idx is None:
         tokens = text.lower().split()
         token_ids = [1] * len(tokens)
@@ -321,77 +309,163 @@ def predict(model, image, text_tensor, device):
     return prediction, confidence, probabilities
 
 # ============================================================================
-# L32 GRAD-CAM - FIXED TO USE CORRECT MOBILENETV2 STRUCTURE
+# LAYER 5 GRAD-CAM
 # ============================================================================
 
-def get_mobilenetv2_target_layer(model):
-    """Get the correct target layer for MobileNetV2."""
-    # The last layer of features is the target (L32 in MobileNetV2)
-    if hasattr(model.vision, 'features'):
-        # MobileNetV2 features is a Sequential module
-        # The last layer (index -1) is the final conv block
-        return model.vision.features[-1]
-    return None
-
-def upsample_heatmap(heatmap, target_size):
-    import torch.nn.functional as F
-    heatmap_tensor = torch.tensor(heatmap).unsqueeze(0).unsqueeze(0).float()
-    upsampled = F.interpolate(heatmap_tensor, size=target_size, mode='bilinear', align_corners=False)
-    return upsampled.squeeze().cpu().numpy()
-
-def generate_l32_gradcam(model, image, text_tensor, device, target_class=None):
-    try:
-        target_layer = get_mobilenetv2_target_layer(model)
-        if target_layer is None:
-            return None
-        
-        activations = None
-        gradients = None
-        
+class GradCAM:
+    """Grad-CAM implementation for target layer."""
+    
+    def __init__(self, model, target_layer, device):
+        self.model = model
+        self.target_layer = target_layer
+        self.device = device
+        self.gradients = None
+        self.activations = None
+        self._register_hooks()
+    
+    def _register_hooks(self):
         def forward_hook(module, input, output):
-            nonlocal activations
-            activations = output
-        
+            self.activations = output
+            
         def backward_hook(module, grad_input, grad_output):
-            nonlocal gradients
-            gradients = grad_output[0]
+            self.gradients = grad_output[0]
+            
+        self.target_layer.register_forward_hook(forward_hook)
+        self.target_layer.register_backward_hook(backward_hook)
+    
+    def generate_heatmap(self, image, text_tensor, target_class=None):
+        """Generate Grad-CAM heatmap."""
         
-        forward_handle = target_layer.register_forward_hook(forward_hook)
-        backward_handle = target_layer.register_backward_hook(backward_hook)
+        self.model.eval()
+        self.model.zero_grad()
         
-        image = image.to(device)
-        text_tensor = text_tensor.to(device)
+        # Forward pass
+        image = image.to(self.device)
+        text_tensor = text_tensor.to(self.device)
         image.requires_grad = True
         
-        outputs = model(image, text_tensor)
+        output = self.model(image, text_tensor)
         
         if target_class is None:
-            target_class = torch.argmax(outputs, dim=1).item()
+            target_class = torch.argmax(output, dim=1).item()
         
-        model.zero_grad()
-        outputs[0][target_class].backward()
+        # Backward pass
+        self.model.zero_grad()
+        loss = output[0, target_class]
+        loss.backward()
         
-        forward_handle.remove()
-        backward_handle.remove()
+        # Get gradients and activations
+        gradients = self.gradients
+        activations = self.activations
         
-        if activations is not None and gradients is not None:
-            pooled_gradients = torch.mean(gradients, dim=[0, 2, 3])
-            for i in range(activations.size(1)):
-                activations[:, i, :, :] *= pooled_gradients[i]
-            
-            heatmap = torch.mean(activations, dim=1).squeeze().cpu().detach().numpy()
-            heatmap = np.maximum(heatmap, 0)
-            if np.max(heatmap) > 0:
-                heatmap = heatmap / np.max(heatmap)
-            
-            heatmap_resized = upsample_heatmap(heatmap, (224, 224))
-            return heatmap_resized
+        if gradients is None or activations is None:
+            return None, target_class
         
-        return None
+        # Global average pooling of gradients
+        weights = gradients.mean(dim=(2, 3), keepdim=True)
+        
+        # Weighted combination
+        cam = (weights * activations).sum(dim=1, keepdim=True)
+        cam = F.relu(cam)
+        
+        # Normalize
+        cam = cam - cam.min()
+        cam = cam / (cam.max() + 1e-8)
+        
+        heatmap = cam.squeeze().cpu().detach().numpy()
+        
+        return heatmap, target_class
+    
+    def overlay_heatmap(self, image, heatmap, alpha=0.5):
+        """Overlay heatmap on original image."""
+        
+        # Convert image to numpy
+        if isinstance(image, torch.Tensor):
+            img = image.squeeze().cpu().numpy()
+            if img.shape[0] == 3:
+                img = img.transpose(1, 2, 0)
+            img = (img - img.min()) / (img.max() - img.min())
+            img = np.uint8(255 * img)
+        else:
+            img = np.array(image)
+        
+        # Ensure img is RGB
+        if len(img.shape) == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        elif img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+        
+        # Resize heatmap
+        heatmap_resized = cv2.resize(heatmap, (img.shape[1], img.shape[0]))
+        
+        # Convert to heatmap color
+        heatmap_color = np.uint8(255 * heatmap_resized)
+        heatmap_color = cv2.applyColorMap(heatmap_color, cv2.COLORMAP_JET)
+        
+        # Overlay
+        overlayed = cv2.addWeighted(img, 1 - alpha, heatmap_color, alpha, 0)
+        
+        return overlayed, heatmap_resized
+
+def get_layer_5(model):
+    """
+    Get Layer 5 (the 5th Conv2d layer) for Grad-CAM.
+    Layer 5 captures: edges, colors, and basic patterns.
+    """
+    
+    # Collect all Conv2d layers from vision encoder
+    conv_layers = []
+    
+    def collect_layers(module):
+        for child in module.children():
+            if isinstance(child, nn.Conv2d):
+                conv_layers.append(child)
+            collect_layers(child)
+    
+    collect_layers(model.vision)
+    
+    st.info(f"Found {len(conv_layers)} Conv2d layers in vision encoder")
+    
+    # Return layer at index 5 (0-based)
+    target_index = 5
+    if target_index < len(conv_layers):
+        st.info(f"Using Layer {target_index}: {type(conv_layers[target_index]).__name__}")
+        return conv_layers[target_index]
+    else:
+        # Fallback to last layer if index 5 doesn't exist
+        st.warning(f"Layer {target_index} not found. Using last layer (index {len(conv_layers)-1}).")
+        return conv_layers[-1]
+
+def generate_layer5_gradcam(model, image, text_tensor, device, target_class=None):
+    """Generate Layer 5 Grad-CAM explanation."""
+    try:
+        # Get Layer 5
+        target_layer = get_layer_5(model)
+        
+        if target_layer is None:
+            return None, None
+        
+        # Create Grad-CAM instance
+        gradcam = GradCAM(model, target_layer, device)
+        
+        # Generate heatmap
+        heatmap, target_class = gradcam.generate_heatmap(
+            image, text_tensor, target_class
+        )
+        
+        if heatmap is None:
+            return None, None
+        
+        # Create overlay
+        overlay, heatmap_resized = gradcam.overlay_heatmap(
+            image, heatmap, alpha=0.6
+        )
+        
+        return overlay, heatmap_resized
         
     except Exception as e:
-        print(f"L32 Grad-CAM error: {e}")
-        return None
+        st.warning(f"Layer 5 Grad-CAM error: {e}")
+        return None, None
 
 # ============================================================================
 # LIME FOR TEXT EXPLANATION
@@ -402,7 +476,7 @@ def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50)
     if len(words) == 0:
         return None, []
     
-    text_tensor = tokenize_text(text, word_to_idx, max_len)
+    text_tensor = preprocess_text(text, word_to_idx, max_len)
     text_tensor = text_tensor.to(device)
     dummy_image = torch.zeros(1, 3, 224, 224).to(device)
     
@@ -419,7 +493,7 @@ def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50)
         if len(perturbed_text.strip()) == 0:
             continue
         
-        perturbed_tensor = tokenize_text(perturbed_text, word_to_idx, max_len)
+        perturbed_tensor = preprocess_text(perturbed_text, word_to_idx, max_len)
         perturbed_tensor = perturbed_tensor.to(device)
         
         with torch.no_grad():
@@ -441,15 +515,15 @@ def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50)
 # ============================================================================
 
 st.set_page_config(
-    page_title="Emotion Classifier",
+    page_title="Emotion Analysis from Children's Drawings",
     page_icon="🎨",
     layout="wide"
 )
 
 st.markdown("""
 <style>
-    .main-header { font-size: 2rem; font-weight: 700; color: #2c3e50; text-align: center; margin-bottom: 0.3rem; }
-    .sub-header { font-size: 0.9rem; color: #7f8c8d; text-align: center; margin-bottom: 1rem; }
+    .main-header { font-size: 2.2rem; font-weight: 700; color: #2c3e50; text-align: center; margin-bottom: 0.3rem; }
+    .sub-header { font-size: 1rem; color: #7f8c8d; text-align: center; margin-bottom: 1.5rem; }
     .result-box { padding: 15px; border-radius: 10px; text-align: center; margin: 5px 0; }
     .happy { background-color: #d4edda; border: 2px solid #28a745; }
     .sad { background-color: #f8d7da; border: 2px solid #dc3545; }
@@ -457,7 +531,7 @@ st.markdown("""
     .confidence-fill { height: 100%; border-radius: 8px; transition: width 0.5s; display: flex; align-items: center; justify-content: center; color: white; font-size: 0.6rem; font-weight: bold; }
     .confidence-fill.happy { background: linear-gradient(90deg, #28a745, #20c997); }
     .confidence-fill.sad { background: linear-gradient(90deg, #dc3545, #e74c3c); }
-    .stButton button { width: 100%; background: #3498db; color: white; font-weight: 600; padding: 8px; font-size: 0.9rem; }
+    .stButton button { width: 100%; background: #3498db; color: white; font-weight: 600; padding: 10px; font-size: 1rem; }
     .stButton button:hover { background: #2980b9; }
     .model-info { background: #f8f9fa; padding: 10px; border-radius: 8px; border: 1px solid #e9ecef; margin-bottom: 10px; font-size: 0.8rem; }
     .model-info table { width: 100%; font-size: 0.8rem; }
@@ -467,11 +541,19 @@ st.markdown("""
     .word-highlight.high { background: #dc3545; color: white; }
     .word-highlight.medium { background: #ffc107; color: #333; }
     .word-highlight.low { background: #e9ecef; color: #333; }
+    .layer-info { background: #e8f4fd; padding: 8px 12px; border-radius: 6px; border-left: 4px solid #3498db; font-size: 0.8rem; margin: 5px 0; }
 </style>
 """, unsafe_allow_html=True)
 
 # ============================================================================
-# SIDEBAR
+# HEADER
+# ============================================================================
+
+st.markdown('<div class="main-header">🎨 Emotion Analysis from Children\'s Drawings</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | Layer 5 Grad-CAM + LIME Explainability</div>', unsafe_allow_html=True)
+
+# ============================================================================
+# SIDEBAR - LOAD RESOURCES
 # ============================================================================
 
 with st.sidebar:
@@ -492,9 +574,18 @@ with st.sidebar:
     st.markdown("""
     <div class="model-info">
         <table>
-            <tr><td class="label">Visual</td><td>L32 Grad-CAM</td></tr>
+            <tr><td class="label">Visual</td><td>Layer 5 Grad-CAM</td></tr>
             <tr><td class="label">Text</td><td>LIME</td></tr>
         </table>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("""
+    <div class="layer-info">
+        <b>Layer 5</b> captures early visual features:
+        <br>• Edges and contours
+        <br>• Colors and textures
+        <br>• Simple patterns
     </div>
     """, unsafe_allow_html=True)
     
@@ -513,7 +604,7 @@ with st.sidebar:
         if result is not None and len(result) == 2:
             word_to_idx, vocab_size = result
             if word_to_idx is not None:
-                st.success(f"✅ Vocabulary loaded (Size: {vocab_size})")
+                st.success(f"Vocabulary loaded (Size: {vocab_size})")
             else:
                 st.warning("Using fallback vocabulary")
                 word_to_idx = {'<PAD>': 0, '<UNK>': 1}
@@ -528,62 +619,64 @@ with st.sidebar:
         try:
             model, device = load_model(vocab_size)
             if model is not None:
-                st.success("✅ Model ready!")
+                st.success("Model ready!")
             else:
-                st.error("❌ Model not loaded")
+                st.error("Model not loaded")
         except Exception as e:
             st.error(f"Model error: {e}")
 
 # ============================================================================
-# MAIN CONTENT
+# MAIN CONTENT - TWO COLUMNS
 # ============================================================================
-
-st.markdown('<div class="main-header">🎨 Multimodal Emotion Classifier</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | Children\'s Drawing + Self-Reflection Analysis</div>', unsafe_allow_html=True)
-
-if model is None:
-    st.warning("⚠️ Model not loaded. The app will not work until the model loads successfully.")
-    with st.expander("🔧 Troubleshooting"):
-        st.info("Make sure your Google Drive files are publicly shared:")
-        st.code(f"Model: https://drive.google.com/file/d/{MODEL_FILE_ID}/view")
-        st.code(f"Vocab: https://drive.google.com/file/d/{VOCAB_FILE_ID}/view")
-        st.info("Also verify the file names match:")
-        st.code(f"Expected model name: {MODEL_FILE_NAME}")
-        st.code(f"Expected vocab name: {VOCAB_FILE_NAME}")
 
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    uploaded_image = st.file_uploader("Upload Drawing", type=['jpg', 'jpeg', 'png'], label_visibility="collapsed")
+    st.subheader("Upload Drawing")
     
-    if uploaded_image is not None:
-        image = Image.open(uploaded_image).convert('RGB')
+    uploaded_file = st.file_uploader(
+        "Upload a drawing (PNG, JPG, JPEG)",
+        type=['png', 'jpg', 'jpeg'],
+        label_visibility="collapsed"
+    )
+    
+    if uploaded_file is not None:
+        image = Image.open(uploaded_file).convert('RGB')
         st.image(image, caption="Uploaded Drawing", use_container_width=True)
     else:
         st.info("Upload a drawing (JPG/PNG)")
         image = None
     
+    st.subheader("Self-Reflection Text")
+    
     text_input = st.text_area(
-        "Self-Reflection Text",
-        placeholder="e.g., I felt happy when I played with my friends today...",
-        height=80,
+        "Enter the child's self-reflection about their drawing:",
+        placeholder="Example: I drew this because I felt very happy today...",
+        height=100,
         label_visibility="collapsed"
     )
     if not text_input:
         st.caption("Enter the child's self-reflection text")
 
 with col2:
+    st.subheader("Analysis Results")
+    
     analyze_button = st.button("Analyze Emotion", type="primary", use_container_width=True)
     
-    if analyze_button and uploaded_image is not None and text_input.strip():
+    if analyze_button and uploaded_file is not None:
         if model is None:
-            st.error("❌ Model not loaded. Please check the sidebar.")
+            st.error("Model not loaded. Please check the sidebar.")
         else:
             with st.spinner("Analyzing..."):
                 try:
+                    # Preprocess inputs
                     image_tensor = preprocess_image(image)
-                    text_tensor = tokenize_text(text_input, word_to_idx, max_len=50)
-                    prediction, confidence, probabilities = predict(model, image_tensor, text_tensor, device)
+                    text_tensor = preprocess_text(text_input, word_to_idx, max_len=50)
+                    
+                    # Make prediction
+                    prediction, confidence, probabilities = predict(
+                        model, image_tensor, text_tensor, device
+                    )
                     
                     class_names = ['Happy', 'Sad']
                     predicted_class = class_names[prediction]
@@ -592,21 +685,23 @@ with col2:
                     happy_pct = probabilities[0][0].item() * 100
                     sad_pct = probabilities[0][1].item() * 100
                     
+                    # Display prediction
                     if predicted_class == 'Happy':
                         st.markdown(f"""
                         <div class="result-box happy">
-                            <h2 style="margin: 0;">😊 Happy</h2>
-                            <p style="font-size: 1rem; margin: 0;">Confidence: {confidence_pct:.1f}%</p>
+                            <h2 style="margin: 0;">Happy</h2>
+                            <p style="font-size: 1.2rem; margin: 0;">Confidence: {confidence_pct:.1f}%</p>
                         </div>
                         """, unsafe_allow_html=True)
                     else:
                         st.markdown(f"""
                         <div class="result-box sad">
-                            <h2 style="margin: 0;">😢 Sad</h2>
-                            <p style="font-size: 1rem; margin: 0;">Confidence: {confidence_pct:.1f}%</p>
+                            <h2 style="margin: 0;">Sad</h2>
+                            <p style="font-size: 1.2rem; margin: 0;">Confidence: {confidence_pct:.1f}%</p>
                         </div>
                         """, unsafe_allow_html=True)
                     
+                    # Confidence bars
                     st.markdown("**Confidence Distribution**")
                     col_h, col_s = st.columns(2)
                     with col_h:
@@ -629,81 +724,100 @@ with col2:
                         """, unsafe_allow_html=True)
                     
                     if confidence_pct < 85:
-                        st.warning("⚠️ Low confidence - Manual review recommended")
+                        st.warning("Low confidence - Manual review recommended")
                     else:
-                        st.success("✅ High confidence prediction")
+                        st.success("High confidence prediction")
                     
-                    # L32 Grad-CAM
+                    # ========================================================
+                    # LAYER 5 GRAD-CAM
+                    # ========================================================
                     st.markdown("---")
-                    st.markdown("### L32 Grad-CAM: Visual Attention")
-                    st.caption("Layer 32 - Last convolutional layer of MobileNetV2")
+                    st.markdown("### Layer 5 Grad-CAM: Visual Attention")
+                    st.caption("Layer 5 captures: Edges, Colors, and Basic Patterns")
                     
-                    heatmap = generate_l32_gradcam(model, image_tensor, text_tensor, device, target_class=prediction)
+                    overlay, heatmap = generate_layer5_gradcam(
+                        model, image_tensor, text_tensor, device, target_class=prediction
+                    )
                     
-                    if heatmap is not None:
+                    if overlay is not None and heatmap is not None:
                         fig, axes = plt.subplots(1, 3, figsize=(9, 3))
                         
+                        # Original image
                         axes[0].imshow(image.resize((224, 224)))
                         axes[0].set_title("Original")
                         axes[0].axis('off')
                         
+                        # Heatmap only
                         axes[1].imshow(heatmap, cmap='jet')
-                        axes[1].set_title("L32 Grad-CAM")
+                        axes[1].set_title("Layer 5 Heatmap")
                         axes[1].axis('off')
                         
-                        axes[2].imshow(image.resize((224, 224)))
-                        axes[2].imshow(heatmap, cmap='jet', alpha=0.5)
-                        axes[2].set_title("Overlay")
+                        # Overlay
+                        axes[2].imshow(overlay)
+                        axes[2].set_title("Grad-CAM Overlay")
                         axes[2].axis('off')
                         
                         plt.tight_layout()
                         st.pyplot(fig)
                         plt.close()
+                        
+                        st.caption("🟡 Yellow/Red areas = Regions most important for the prediction")
+                        st.info("Layer 5 captures early visual features like edges, colors, and simple patterns that form the building blocks of the drawing.")
                     else:
-                        st.info("L32 Grad-CAM explanation not available")
+                        st.info("Layer 5 Grad-CAM explanation not available")
                     
-                    # LIME
+                    # ========================================================
+                    # LIME FOR TEXT
+                    # ========================================================
                     st.markdown("### LIME: Text Explanation")
                     
-                    base_pred, word_importance = generate_lime_text_explanation(
-                        text_input, model, word_to_idx, device, max_len=50
-                    )
-                    
-                    if word_importance and len(word_importance) > 0:
-                        highlighted_words = []
-                        for word, importance in word_importance:
-                            if importance > 0.7:
-                                cls = "high"
-                            elif importance > 0.4:
-                                cls = "medium"
-                            else:
-                                cls = "low"
-                            highlighted_words.append(f'<span class="word-highlight {cls}">{word}</span>')
-                        
-                        st.markdown(
-                            f'<div style="padding: 10px; background: #f8f9fa; border-radius: 8px; font-size: 0.95rem; line-height: 1.8;">'
-                            f'{" ".join(highlighted_words)}'
-                            f'</div>',
-                            unsafe_allow_html=True
+                    if text_input.strip():
+                        base_pred, word_importance = generate_lime_text_explanation(
+                            text_input, model, word_to_idx, device, max_len=50
                         )
                         
-                        st.caption("🔴 High importance | 🟡 Medium | ⚪ Low")
-                        class_names_expl = ['Happy', 'Sad']
-                        st.caption(f"Text-based prediction: {class_names_expl[base_pred]}")
+                        if word_importance and len(word_importance) > 0:
+                            highlighted_words = []
+                            for word, importance in word_importance:
+                                if importance > 0.7:
+                                    cls = "high"
+                                elif importance > 0.4:
+                                    cls = "medium"
+                                else:
+                                    cls = "low"
+                                highlighted_words.append(f'<span class="word-highlight {cls}">{word}</span>')
+                            
+                            st.markdown(
+                                f'<div style="padding: 10px; background: #f8f9fa; border-radius: 8px; font-size: 0.95rem; line-height: 1.8;">'
+                                f'{" ".join(highlighted_words)}'
+                                f'</div>',
+                                unsafe_allow_html=True
+                            )
+                            
+                            st.caption("High importance = Red | Medium = Yellow | Low = Gray")
+                            class_names_expl = ['Happy', 'Sad']
+                            st.caption(f"Text-based prediction: {class_names_expl[base_pred]}")
+                        else:
+                            st.info("LIME explanation not available for this text")
                     else:
-                        st.info("LIME explanation not available")
+                        st.info("No text provided for LIME explanation")
                     
                 except Exception as e:
                     st.error(f"Error: {e}")
+    
     elif analyze_button:
-        if uploaded_image is None:
-            st.warning("Upload a drawing")
+        if uploaded_file is None:
+            st.warning("Please upload a drawing")
         if not text_input.strip():
-            st.warning("Enter text")
+            st.warning("Please enter self-reflection text")
+
+# ============================================================================
+# FOOTER
+# ============================================================================
 
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #95a5a6; font-size: 0.7rem;">
-    MobileNetV2 + BiLSTM | L32 Grad-CAM + LIME | 92.69% Val Accuracy | KIDO Dataset
+    MobileNetV2 + BiLSTM | Layer 5 Grad-CAM + LIME | 92.69% Val Accuracy | KIDO Dataset
 </div>
 """, unsafe_allow_html=True)
