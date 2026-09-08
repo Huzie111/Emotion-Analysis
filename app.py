@@ -30,7 +30,7 @@ MODEL_FILE_NAME = "MM_MobileNetV2_BiLSTM_final.pt"
 VOCAB_FILE_NAME = "vocabulary.pth"
 
 # ============================================================================
-# MODEL DEFINITIONS
+# MODEL DEFINITIONS - MATCHING THE SAVED ARCHITECTURE
 # ============================================================================
 
 class BiLSTMTextEncoder(nn.Module):
@@ -50,25 +50,53 @@ class BiLSTMTextEncoder(nn.Module):
         context = torch.sum(attn_weights * lstm_out, dim=1)
         return context
 
+def get_mobilenetv2_encoder(pretrained=False):
+    """Get MobileNetV2 with proper wrapper that matches saved architecture."""
+    
+    # Load the full MobileNetV2 model
+    model = models.mobilenet_v2(pretrained=pretrained)
+    
+    # Define a wrapper that preserves the original structure
+    class MobileNetV2Encoder(nn.Module):
+        def __init__(self, base_model):
+            super().__init__()
+            # Keep the entire features module as is
+            self.features = base_model.features
+            # Add pooling
+            self.pool = nn.AdaptiveAvgPool2d((1, 1))
+            self.feature_dim = 1280
+            
+        def forward(self, x):
+            x = self.features(x)
+            x = self.pool(x)
+            x = x.view(x.size(0), -1)
+            return x
+    
+    return MobileNetV2Encoder(model), 1280
+
 def get_vision_encoder(name, pretrained=False):
+    """Get vision encoder with proper architecture matching saved model."""
+    
+    if name == 'mobilenet_v2':
+        return get_mobilenetv2_encoder(pretrained)
+    
     backbones = {
-        'mobilenet_v2': (models.mobilenet_v2, 1280),
         'efficientnet_b0': (models.efficientnet_b0, 1280),
         'shufflenet_v2_x1_0': (models.shufflenet_v2_x1_0, 1024),
     }
     
-    if name not in backbones:
-        raise ValueError(f"Unknown model: {name}")
+    if name in backbones:
+        model_fn, dim = backbones[name]
+        model = model_fn(pretrained=pretrained)
+        
+        if hasattr(model, 'classifier'):
+            model.classifier = nn.Identity()
+        elif hasattr(model, 'fc'):
+            model.fc = nn.Identity()
+        
+        return model, dim
     
-    model_fn, dim = backbones[name]
-    model = model_fn(pretrained=pretrained)
-    
-    if hasattr(model, 'classifier'):
-        model.classifier = nn.Identity()
-    elif hasattr(model, 'fc'):
-        model.fc = nn.Identity()
-    
-    return model, dim
+    raise ValueError(f"Unknown model: {name}")
 
 class MultimodalModel(nn.Module):
     def __init__(self, vision_name, text_encoder, dropout=0.7):
@@ -122,30 +150,22 @@ def create_text_encoder(text_type, vocab_size, hidden=128):
         raise ValueError(f"Unknown text encoder: {text_type}")
 
 # ============================================================================
-# DOWNLOAD FUNCTIONS WITH DEBUGGING
+# DOWNLOAD FUNCTIONS
 # ============================================================================
 
 def download_file_gdown(file_id, file_name, description):
     try:
         url = f"https://drive.google.com/uc?id={file_id}"
-        st.info(f"📥 Attempting gdown download from: {url}")
         gdown.download(url, file_name, quiet=False)
-        
-        # Check if file was created
         if os.path.exists(file_name):
-            size = os.path.getsize(file_name)
-            st.info(f"✅ Downloaded {file_name} ({size/1024:.1f} KB)")
             return True
-        else:
-            st.warning(f"File not created after gdown download")
-            return False
+        return False
     except Exception as e:
         st.warning(f"gdown failed: {e}")
         return False
 
 def download_file_requests(file_id, file_name, description):
     try:
-        st.info(f"📥 Attempting requests download for {description}")
         url = f"https://drive.google.com/uc?export=download&id={file_id}"
         session = requests.Session()
         response = session.get(url, stream=True)
@@ -161,61 +181,38 @@ def download_file_requests(file_id, file_name, description):
             with open(file_name, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
-            
-            if os.path.exists(file_name):
-                size = os.path.getsize(file_name)
-                st.info(f"✅ Downloaded {file_name} ({size/1024:.1f} KB)")
-                return True
+            return True
         return False
     except Exception as e:
         st.warning(f"Requests failed: {e}")
         return False
 
 def download_file(file_id, file_name, description):
-    """Try multiple methods to download."""
-    
-    st.info(f"🔍 Downloading {description}...")
-    
-    # Method 1: gdown
     if download_file_gdown(file_id, file_name, description):
         return True
-    
-    # Method 2: requests
     if download_file_requests(file_id, file_name, description):
         return True
-    
-    st.error(f"❌ All download methods failed for {description}")
+    st.error(f"All download methods failed for {description}")
     return False
 
 # ============================================================================
-# LOAD FUNCTIONS WITH DEBUGGING
+# LOAD FUNCTIONS
 # ============================================================================
 
 def load_vocabulary():
     try:
-        # Check if file exists
-        if os.path.exists(VOCAB_FILE_NAME):
-            st.info(f"✅ Vocabulary file already exists: {VOCAB_FILE_NAME}")
-        else:
-            st.info(f"📥 Vocabulary file not found. Downloading...")
+        if not os.path.exists(VOCAB_FILE_NAME):
             success = download_file(VOCAB_FILE_ID, VOCAB_FILE_NAME, "vocabulary")
             if not success:
-                st.error("Failed to download vocabulary")
                 return None, None
         
-        # Check file size
         file_size = os.path.getsize(VOCAB_FILE_NAME)
-        st.info(f"📊 Vocabulary file size: {file_size/1024:.1f} KB")
-        
         if file_size < 1000:
-            st.warning(f"Vocabulary file too small ({file_size} bytes). Deleting and re-downloading...")
             os.remove(VOCAB_FILE_NAME)
             success = download_file(VOCAB_FILE_ID, VOCAB_FILE_NAME, "vocabulary")
             if not success:
                 return None, None
         
-        # Load vocabulary
-        st.info("📖 Loading vocabulary...")
         vocab_data = torch.load(VOCAB_FILE_NAME, map_location='cpu')
         
         if isinstance(vocab_data, dict):
@@ -224,56 +221,47 @@ def load_vocabulary():
             word_to_idx = vocab_data
         
         vocab_size = len(word_to_idx)
-        st.success(f"✅ Vocabulary loaded! Size: {vocab_size}")
         return word_to_idx, vocab_size
         
     except Exception as e:
-        st.error(f"❌ Error loading vocabulary: {e}")
+        st.error(f"Error loading vocabulary: {e}")
         return None, None
 
 def load_model(vocab_size):
     try:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        st.info(f"🖥️ Using device: {device}")
         
-        # Check if model exists
-        if os.path.exists(MODEL_FILE_NAME):
-            st.info(f"✅ Model file already exists: {MODEL_FILE_NAME}")
-        else:
-            st.info(f"📥 Model file not found. Downloading...")
+        if not os.path.exists(MODEL_FILE_NAME):
             success = download_file(MODEL_FILE_ID, MODEL_FILE_NAME, "model")
             if not success:
-                st.error("Failed to download model")
                 return None, device
         
-        # Check file size
         file_size = os.path.getsize(MODEL_FILE_NAME)
-        st.info(f"📊 Model file size: {file_size/1024:.1f} KB")
-        
         if file_size < 1000000:
-            st.warning(f"Model file too small ({file_size/1024:.1f} KB). Deleting and re-downloading...")
             os.remove(MODEL_FILE_NAME)
             success = download_file(MODEL_FILE_ID, MODEL_FILE_NAME, "model")
             if not success:
                 return None, device
         
-        # Create model
-        st.info("🔧 Creating model architecture...")
+        # Create model with proper architecture
         text_enc = create_text_encoder('bilstm', vocab_size, hidden=128)
         model = MultimodalModel('mobilenet_v2', text_enc)
         
-        # Load weights
-        st.info("📂 Loading model weights...")
+        # Load weights with strict=False to handle any minor mismatches
         checkpoint = torch.load(MODEL_FILE_NAME, map_location=device)
         
         if 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
-            st.info("✅ Loaded checkpoint with 'model_state_dict'")
         else:
             state_dict = checkpoint
-            st.info("✅ Loaded checkpoint (direct state_dict)")
         
-        model.load_state_dict(state_dict)
+        # Try loading with strict=False to ignore missing keys
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        
+        if missing_keys:
+            st.warning(f"Missing keys: {len(missing_keys)} keys")
+        if unexpected_keys:
+            st.warning(f"Unexpected keys: {len(unexpected_keys)} keys")
         
         model.to(device)
         model.eval()
@@ -281,7 +269,7 @@ def load_model(vocab_size):
         return model, device
         
     except Exception as e:
-        st.error(f"❌ Error loading model: {e}")
+        st.error(f"Error loading model: {e}")
         return None, torch.device('cpu')
 
 # ============================================================================
@@ -333,19 +321,17 @@ def predict(model, image, text_tensor, device):
     return prediction, confidence, probabilities
 
 # ============================================================================
-# L32 GRAD-CAM (Layer 32) - MobileNetV2 specific
+# L32 GRAD-CAM - FIXED TO USE CORRECT MOBILENETV2 STRUCTURE
 # ============================================================================
 
 def get_mobilenetv2_target_layer(model):
+    """Get the correct target layer for MobileNetV2."""
+    # The last layer of features is the target (L32 in MobileNetV2)
     if hasattr(model.vision, 'features'):
-        target_layer = model.vision.features[-1]
-        return target_layer
-    else:
-        last_conv = None
-        for name, module in model.vision.named_modules():
-            if isinstance(module, nn.Conv2d):
-                last_conv = module
-        return last_conv
+        # MobileNetV2 features is a Sequential module
+        # The last layer (index -1) is the final conv block
+        return model.vision.features[-1]
+    return None
 
 def upsample_heatmap(heatmap, target_size):
     import torch.nn.functional as F
@@ -481,12 +467,11 @@ st.markdown("""
     .word-highlight.high { background: #dc3545; color: white; }
     .word-highlight.medium { background: #ffc107; color: #333; }
     .word-highlight.low { background: #e9ecef; color: #333; }
-    .debug-box { background: #f8f9fa; padding: 10px; border-radius: 8px; border: 1px solid #ffc107; font-size: 0.8rem; margin: 10px 0; }
 </style>
 """, unsafe_allow_html=True)
 
 # ============================================================================
-# SIDEBAR - LOAD RESOURCES WITH DEBUGGING
+# SIDEBAR
 # ============================================================================
 
 with st.sidebar:
@@ -518,19 +503,11 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### Loading Resources...")
     
-    # DEBUG: Show file IDs
-    with st.expander("🔧 Debug Info"):
-        st.code(f"Model ID: {MODEL_FILE_ID}")
-        st.code(f"Vocab ID: {VOCAB_FILE_ID}")
-        st.code(f"Model File: {MODEL_FILE_NAME}")
-        st.code(f"Vocab File: {VOCAB_FILE_NAME}")
-    
     word_to_idx = None
     vocab_size = 3423
     model = None
     device = torch.device('cpu')
     
-    # Try loading vocabulary
     try:
         result = load_vocabulary()
         if result is not None and len(result) == 2:
@@ -538,17 +515,15 @@ with st.sidebar:
             if word_to_idx is not None:
                 st.success(f"✅ Vocabulary loaded (Size: {vocab_size})")
             else:
-                st.warning("⚠️ Vocabulary returned None - using fallback")
+                st.warning("Using fallback vocabulary")
                 word_to_idx = {'<PAD>': 0, '<UNK>': 1}
         else:
-            st.warning("⚠️ No vocabulary - using fallback")
+            st.warning("Using fallback vocabulary")
             word_to_idx = {'<PAD>': 0, '<UNK>': 1}
     except Exception as e:
-        st.error(f"❌ Vocabulary error: {e}")
-        st.warning("Using fallback vocabulary")
+        st.error(f"Vocabulary error: {e}")
         word_to_idx = {'<PAD>': 0, '<UNK>': 1}
     
-    # Try loading model
     if word_to_idx is not None:
         try:
             model, device = load_model(vocab_size)
@@ -556,14 +531,8 @@ with st.sidebar:
                 st.success("✅ Model ready!")
             else:
                 st.error("❌ Model not loaded")
-                st.info("Troubleshooting tips:")
-                st.info("1. Verify Google Drive links work in browser")
-                st.info("2. Check if files are publicly shared")
-                st.info("3. Try downloading manually and placing in repo")
         except Exception as e:
-            st.error(f"❌ Model error: {e}")
-    else:
-        st.error("Cannot load model without vocabulary")
+            st.error(f"Model error: {e}")
 
 # ============================================================================
 # MAIN CONTENT
@@ -572,16 +541,19 @@ with st.sidebar:
 st.markdown('<div class="main-header">🎨 Multimodal Emotion Classifier</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | Children\'s Drawing + Self-Reflection Analysis</div>', unsafe_allow_html=True)
 
-# If model not loaded, show warning prominently
 if model is None:
-    st.warning("⚠️ Model not loaded. Please check the sidebar for debug information.")
-    st.info("💡 You can still upload inputs, but predictions will not work until the model loads.")
+    st.warning("⚠️ Model not loaded. The app will not work until the model loads successfully.")
+    with st.expander("🔧 Troubleshooting"):
+        st.info("Make sure your Google Drive files are publicly shared:")
+        st.code(f"Model: https://drive.google.com/file/d/{MODEL_FILE_ID}/view")
+        st.code(f"Vocab: https://drive.google.com/file/d/{VOCAB_FILE_ID}/view")
+        st.info("Also verify the file names match:")
+        st.code(f"Expected model name: {MODEL_FILE_NAME}")
+        st.code(f"Expected vocab name: {VOCAB_FILE_NAME}")
 
-# Compact 2-column layout
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    # Image upload
     uploaded_image = st.file_uploader("Upload Drawing", type=['jpg', 'jpeg', 'png'], label_visibility="collapsed")
     
     if uploaded_image is not None:
@@ -591,7 +563,6 @@ with col1:
         st.info("Upload a drawing (JPG/PNG)")
         image = None
     
-    # Text input
     text_input = st.text_area(
         "Self-Reflection Text",
         placeholder="e.g., I felt happy when I played with my friends today...",
@@ -602,20 +573,11 @@ with col1:
         st.caption("Enter the child's self-reflection text")
 
 with col2:
-    # Results area
     analyze_button = st.button("Analyze Emotion", type="primary", use_container_width=True)
     
     if analyze_button and uploaded_image is not None and text_input.strip():
         if model is None:
-            st.error("❌ Model not loaded. Please check:")
-            st.info("1. Google Drive files are publicly shared")
-            st.info("2. File IDs are correct")
-            st.info("3. Internet connection is available")
-            
-            # Show manual download links
-            st.markdown("**Manual Download Links:**")
-            st.code(f"Model: https://drive.google.com/file/d/{MODEL_FILE_ID}/view")
-            st.code(f"Vocab: https://drive.google.com/file/d/{VOCAB_FILE_ID}/view")
+            st.error("❌ Model not loaded. Please check the sidebar.")
         else:
             with st.spinner("Analyzing..."):
                 try:
@@ -630,7 +592,6 @@ with col2:
                     happy_pct = probabilities[0][0].item() * 100
                     sad_pct = probabilities[0][1].item() * 100
                     
-                    # Show prediction
                     if predicted_class == 'Happy':
                         st.markdown(f"""
                         <div class="result-box happy">
@@ -646,7 +607,6 @@ with col2:
                         </div>
                         """, unsafe_allow_html=True)
                     
-                    # Confidence bars
                     st.markdown("**Confidence Distribution**")
                     col_h, col_s = st.columns(2)
                     with col_h:
@@ -673,7 +633,7 @@ with col2:
                     else:
                         st.success("✅ High confidence prediction")
                     
-                    # L32 GRAD-CAM
+                    # L32 Grad-CAM
                     st.markdown("---")
                     st.markdown("### L32 Grad-CAM: Visual Attention")
                     st.caption("Layer 32 - Last convolutional layer of MobileNetV2")
@@ -702,7 +662,7 @@ with col2:
                     else:
                         st.info("L32 Grad-CAM explanation not available")
                     
-                    # LIME for text
+                    # LIME
                     st.markdown("### LIME: Text Explanation")
                     
                     base_pred, word_importance = generate_lime_text_explanation(
@@ -734,17 +694,12 @@ with col2:
                         st.info("LIME explanation not available")
                     
                 except Exception as e:
-                    st.error(f"❌ Error: {e}")
-                    st.info("Please try again with different inputs.")
+                    st.error(f"Error: {e}")
     elif analyze_button:
         if uploaded_image is None:
-            st.warning("⚠️ Upload a drawing")
+            st.warning("Upload a drawing")
         if not text_input.strip():
-            st.warning("⚠️ Enter text")
-
-# ============================================================================
-# FOOTER
-# ============================================================================
+            st.warning("Enter text")
 
 st.markdown("---")
 st.markdown("""
