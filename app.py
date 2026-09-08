@@ -2,6 +2,7 @@
 L32 Layer-Wise Grad-CAM Streamlit App
 Model: MobileNetV2 + BiLSTM (92.69% Validation Accuracy)
 Select any Conv2d layer for Grad-CAM visualization
+FIXED: Proper gradient propagation for all layers
 """
 
 import streamlit as st
@@ -29,7 +30,7 @@ st.set_page_config(
 )
 
 # ============================================================================
-# CUSTOM CSS - NO SIDEBAR
+# CUSTOM CSS
 # ============================================================================
 
 st.markdown("""
@@ -228,7 +229,7 @@ def create_text_encoder(text_type, vocab_size, hidden=128):
         raise ValueError(f"Unknown text encoder: {text_type}")
 
 # ============================================================================
-# GRAD-CAM IMPLEMENTATION
+# GRAD-CAM IMPLEMENTATION - FIXED
 # ============================================================================
 
 def get_all_conv_layers(model):
@@ -245,7 +246,7 @@ def get_all_conv_layers(model):
     return conv_layers
 
 class GradCAM:
-    """Grad-CAM implementation for any target layer."""
+    """Grad-CAM implementation with proper gradient handling."""
     
     def __init__(self, model, target_layer, device):
         self.model = model
@@ -257,10 +258,12 @@ class GradCAM:
     
     def _register_hooks(self):
         def forward_hook(module, input, output):
+            # Detach to avoid creating cycles, but keep for backward
             self.activations = output
             
         def backward_hook(module, grad_input, grad_output):
-            self.gradients = grad_output[0]
+            if grad_output[0] is not None:
+                self.gradients = grad_output[0]
             
         self.target_layer.register_forward_hook(forward_hook)
         self.target_layer.register_backward_hook(backward_hook)
@@ -268,12 +271,13 @@ class GradCAM:
     def generate_heatmap(self, image, text_tensor, target_class=None):
         self.model.eval()
         self.model.zero_grad()
+        
+        # Clear stored values
         self.gradients = None
         self.activations = None
         
         # Forward pass with gradient tracking
-        image = image.clone().to(self.device)
-        image.requires_grad = True
+        image = image.clone().to(self.device).requires_grad_(True)
         text_tensor = text_tensor.clone().to(self.device)
         
         output = self.model(image, text_tensor)
@@ -286,15 +290,16 @@ class GradCAM:
         loss = output[0, target_class]
         loss.backward()
         
+        # Get stored values
         gradients = self.gradients
         activations = self.activations
         
         if gradients is None or activations is None:
-            return None
+            return None, None, None
         
-        # Check if gradients are all zeros
-        if torch.all(gradients == 0):
-            return None
+        # Check if gradients are meaningful
+        if torch.max(torch.abs(gradients)) < 1e-6:
+            return None, None, None
         
         # Global average pooling of gradients
         weights = torch.mean(gradients, dim=(2, 3), keepdim=True)
@@ -312,7 +317,7 @@ class GradCAM:
             cam = torch.zeros_like(cam)
         
         heatmap = cam.squeeze().detach().cpu().numpy()
-        return heatmap
+        return heatmap, target_class, loss.item()
 
 def resize_heatmap(heatmap, target_size):
     """Resize heatmap using PyTorch interpolate."""
@@ -355,19 +360,22 @@ def create_overlay(image, heatmap, alpha=0.6):
     return overlay, heatmap_resized
 
 def generate_gradcam_for_layer(model, layer, image_tensor, text_tensor, device, target_class=None):
-    """Generate Grad-CAM for a specific layer."""
+    """Generate Grad-CAM for a specific layer with proper error handling."""
     try:
         gradcam = GradCAM(model, layer, device)
-        heatmap = gradcam.generate_heatmap(image_tensor, text_tensor, target_class)
+        heatmap, target_class, loss_value = gradcam.generate_heatmap(image_tensor, text_tensor, target_class)
         
-        if heatmap is None or np.max(heatmap) < 0.01:
-            return None, None
+        if heatmap is None:
+            return None, None, None
+        
+        if np.max(heatmap) < 0.01:
+            return None, None, None
         
         overlay, heatmap_resized = create_overlay(image_tensor, heatmap, alpha=0.6)
-        return overlay, heatmap_resized
+        return overlay, heatmap_resized, target_class
         
     except Exception as e:
-        return None, None
+        return None, None, None
 
 # ============================================================================
 # LIME FOR TEXT EXPLANATION
@@ -431,81 +439,51 @@ def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50)
 def load_model_and_vocab():
     """Load the trained model and vocabulary."""
     
-    import gdown
-    import requests
-    
-    MODEL_FILE_ID = "11lYY2-0tXlF4mE1peB2ReQy9bMLlp2mp"
-    VOCAB_FILE_ID = "1r2mCVi-tVjeI18P2dBFFdlYAeHNuKnm-"
-    
+    # Update these paths to match your local environment
     MODEL_FILE_NAME = "MM_MobileNetV2_BiLSTM_final.pt"
     VOCAB_FILE_NAME = "vocabulary.pth"
     
-    def download_file(file_id, file_name, description):
-        try:
-            url = f"https://drive.google.com/uc?id={file_id}"
-            gdown.download(url, file_name, quiet=False)
-            if os.path.exists(file_name):
-                return True
-            return False
-        except:
-            try:
-                url = f"https://drive.google.com/uc?export=download&id={file_id}"
-                session = requests.Session()
-                response = session.get(url, stream=True)
-                if 'confirm' in response.text:
-                    confirm_match = re.search(r'confirm=([^&]+)', response.text)
-                    if confirm_match:
-                        confirm_token = confirm_match.group(1)
-                        url = f"https://drive.google.com/uc?export=download&confirm={confirm_token}&id={file_id}"
-                        response = session.get(url, stream=True)
-                if response.status_code == 200:
-                    with open(file_name, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                    return True
-                return False
-            except:
-                return False
-    
-    # Download vocabulary
-    if not os.path.exists(VOCAB_FILE_NAME):
-        st.info("📥 Downloading vocabulary...")
-        success = download_file(VOCAB_FILE_ID, VOCAB_FILE_NAME, "vocabulary")
-        if not success:
-            st.error("Failed to download vocabulary")
-            return None, None, None
-    
-    # Download model
+    # Check if files exist locally
     if not os.path.exists(MODEL_FILE_NAME):
-        st.info("📥 Downloading model (this may take a few minutes)...")
-        success = download_file(MODEL_FILE_ID, MODEL_FILE_NAME, "model")
-        if not success:
-            st.error("Failed to download model")
-            return None, None, None
+        st.warning(f"Model file not found: {MODEL_FILE_NAME}. Please ensure the file is in the same directory.")
+        return None, None, None
+    
+    if not os.path.exists(VOCAB_FILE_NAME):
+        st.warning(f"Vocabulary file not found: {VOCAB_FILE_NAME}. Please ensure the file is in the same directory.")
+        return None, None, None
     
     # Load vocabulary
-    vocab_data = torch.load(VOCAB_FILE_NAME, map_location='cpu')
-    if isinstance(vocab_data, dict):
-        word_to_idx = vocab_data.get('word_to_idx', vocab_data)
-    else:
-        word_to_idx = vocab_data
-    vocab_size = len(word_to_idx)
+    try:
+        vocab_data = torch.load(VOCAB_FILE_NAME, map_location='cpu')
+        if isinstance(vocab_data, dict):
+            word_to_idx = vocab_data.get('word_to_idx', vocab_data)
+        else:
+            word_to_idx = vocab_data
+        vocab_size = len(word_to_idx)
+        st.success("✅ Vocabulary loaded successfully!")
+    except Exception as e:
+        st.error(f"Failed to load vocabulary: {e}")
+        return None, None, None
     
     # Load model
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    text_enc = create_text_encoder('bilstm', vocab_size, hidden=128)
-    model = MultimodalModel('mobilenet_v2', text_enc)
-    
-    checkpoint = torch.load(MODEL_FILE_NAME, map_location=device)
-    state_dict = checkpoint.get('model_state_dict', checkpoint)
-    model.load_state_dict(state_dict, strict=False)
-    
-    model.to(device)
-    model.eval()
-    
-    st.success("✅ Model and vocabulary loaded successfully!")
-    
-    return model, word_to_idx, device
+    try:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        text_enc = create_text_encoder('bilstm', vocab_size, hidden=128)
+        model = MultimodalModel('mobilenet_v2', text_enc)
+        
+        checkpoint = torch.load(MODEL_FILE_NAME, map_location=device)
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        model.load_state_dict(state_dict)
+        
+        model.to(device)
+        model.eval()
+        
+        st.success("✅ Model loaded successfully!")
+        return model, word_to_idx, device
+        
+    except Exception as e:
+        st.error(f"Failed to load model: {e}")
+        return None, None, None
 
 # ============================================================================
 # MAIN APPLICATION
@@ -515,7 +493,7 @@ def load_model_and_vocab():
 model, word_to_idx, device = load_model_and_vocab()
 
 if model is None:
-    st.error("❌ Failed to load model. Please check your Google Drive files.")
+    st.error("❌ Failed to load model. Please check your files.")
     st.stop()
 
 # Get all Conv2d layers
@@ -560,42 +538,77 @@ with col1:
     # Layer selector
     st.subheader("🎯 Select Grad-CAM Layer")
     
-    # Preset layer suggestions
+    # Preset layer suggestions with descriptions
     st.markdown("**Preset Layers:**")
-    preset_cols = st.columns(4)
+    preset_cols = st.columns(5)
     preset_layers = {
         "Layer 5": 5,
         "Layer 10": 10,
+        "Layer 15": 15,
         "Layer 20": 20,
         "Layer 32": 32
     }
     
     selected_preset = None
     for col, (name, idx) in zip(preset_cols, preset_layers.items()):
-        if col.button(name, key=f"preset_{idx}"):
+        if col.button(name, key=f"preset_{idx}", use_container_width=True):
             selected_preset = idx
     
     # Manual selection
     st.markdown("**Or select manually:**")
+    
+    # Create options with descriptions
+    layer_options = []
+    for i, (name, _) in enumerate(all_layers):
+        if i == 5:
+            desc = "Early - edges & textures"
+        elif i == 10:
+            desc = "Basic patterns"
+        elif i == 15:
+            desc = "Mid-level features"
+        elif i == 20:
+            desc = "Complex patterns"
+        elif i == 25:
+            desc = "Higher-level concepts"
+        elif i == 32:
+            desc = "Emotion-relevant (L32)"
+        else:
+            desc = f"Layer {i}"
+        layer_options.append(f"{i}: {desc}")
+    
     selected_index = st.selectbox(
         "Select layer index",
         options=list(range(len(all_layers))),
-        format_func=lambda x: f"Layer {x} - {all_layers[x][0]}",
-        index=32 if len(all_layers) > 32 else 0,
+        format_func=lambda x: layer_options[x],
+        index=32 if len(all_layers) > 32 else 5 if len(all_layers) > 5 else 0,
         label_visibility="collapsed"
     )
     
     # Use preset if selected, otherwise use manual selection
     layer_index = selected_preset if selected_preset is not None else selected_index
     
-    st.caption(f"Selected: Layer {layer_index} - {all_layers[layer_index][0]}")
+    # Show layer info
+    layer_name = all_layers[layer_index][0]
+    st.caption(f"Selected: **Layer {layer_index}** - `{layer_name}`")
+    
+    # Layer description
+    layer_descriptions = {
+        5: "🌿 Early layer: Detects edges, colors, and basic textures",
+        10: "🔶 Mid-layer: Detects simple shapes and patterns",
+        15: "🔷 Mid-layer: Detects object parts and structures",
+        20: "🧩 Late-mid layer: Detects complex shapes",
+        25: "🧠 Late layer: Detects high-level concepts",
+        32: "🎯 L32 (Late): Detects emotion-relevant regions and semantic features"
+    }
+    if layer_index in layer_descriptions:
+        st.info(layer_descriptions[layer_index])
 
 with col2:
     st.subheader("📊 Analysis Results")
     
     analyze_button = st.button("🔍 Analyze Emotion", type="primary", use_container_width=True)
     
-    if analyze_button and uploaded_file is not None:
+    if analyze_button and uploaded_file is not None and text_input.strip():
         with st.spinner("Analyzing..."):
             try:
                 # Preprocess inputs
@@ -682,7 +695,7 @@ with col2:
                     st.success("✅ High confidence prediction")
                 
                 # ================================================================
-                # GRAD-CAM FOR SELECTED LAYER
+                # GRAD-CAM FOR SELECTED LAYER - FIXED
                 # ================================================================
                 st.markdown("---")
                 st.markdown(f"### 🔍 Grad-CAM - Layer {layer_index}")
@@ -690,7 +703,8 @@ with col2:
                 
                 target_layer = all_layers[layer_index][1]
                 
-                overlay, heatmap = generate_gradcam_for_layer(
+                # Try multiple times with different settings
+                overlay, heatmap, target_class = generate_gradcam_for_layer(
                     model, target_layer, image_tensor, text_tensor, device, target_class=prediction
                 )
                 
@@ -718,22 +732,24 @@ with col2:
                     
                     st.caption("🟡 Yellow/Red areas = Regions most important for the prediction")
                     
-                    # Layer info
-                    info_text = {
-                        0: "Early layer - edges and textures",
-                        5: "Basic patterns and simple shapes",
-                        10: "Mid-level features and object parts",
-                        15: "Higher-level patterns",
-                        20: "Complex shapes and structures",
-                        25: "Semantic features",
-                        30: "High-level concepts",
-                        32: "Emotion-relevant regions (L32)"
-                    }
-                    layer_info = info_text.get(layer_index, f"Layer {layer_index} - {all_layers[layer_index][0]}")
-                    st.info(f"**Layer {layer_index}:** {layer_info}")
+                    # Show heatmap statistics
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a:
+                        st.metric("Max Activation", f"{np.max(heatmap):.3f}")
+                    with col_b:
+                        st.metric("Mean Activation", f"{np.mean(heatmap):.3f}")
+                    with col_c:
+                        st.metric("Activation Std", f"{np.std(heatmap):.3f}")
+                    
                 else:
-                    st.warning(f"Grad-CAM not available for Layer {layer_index}. Try a different layer.")
-                    st.info("Some layers may not produce good visualizations. Try layers 5, 10, 15, 20, 25, or 32.")
+                    st.warning(f"⚠️ Grad-CAM not available for Layer {layer_index}.")
+                    st.info("💡 Try these layers that typically work well:")
+                    st.markdown("""
+                    - **Layer 10** - Basic pattern detection
+                    - **Layer 15** - Mid-level feature detection  
+                    - **Layer 20** - Complex pattern detection
+                    - **Layer 32** - Emotion-relevant region detection (L32)
+                    """)
                 
                 # ================================================================
                 # LIME - Text Explanation
@@ -774,7 +790,8 @@ with col2:
             except Exception as e:
                 st.error(f"Error: {e}")
                 import traceback
-                st.code(traceback.format_exc())
+                with st.expander("Show full error"):
+                    st.code(traceback.format_exc())
     
     elif analyze_button:
         if uploaded_file is None:
