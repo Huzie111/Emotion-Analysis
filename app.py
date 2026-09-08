@@ -12,12 +12,12 @@ import torch.nn.functional as F
 from torchvision import models, transforms
 from PIL import Image
 import numpy as np
-import cv2
 import gdown
 import os
 import requests
 import re
 import matplotlib.pyplot as plt
+from matplotlib import cm
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -253,7 +253,7 @@ def load_model(vocab_size):
         
         model.to(device)
         model.eval()
-        st.success("✅ Model loaded successfully!")
+        st.success("Model loaded successfully!")
         return model, device
         
     except Exception as e:
@@ -309,7 +309,7 @@ def predict(model, image, text_tensor, device):
     return prediction, confidence, probabilities
 
 # ============================================================================
-# LAYER 5 GRAD-CAM
+# LAYER 5 GRAD-CAM (No OpenCV)
 # ============================================================================
 
 class GradCAM:
@@ -375,43 +375,9 @@ class GradCAM:
         heatmap = cam.squeeze().cpu().detach().numpy()
         
         return heatmap, target_class
-    
-    def overlay_heatmap(self, image, heatmap, alpha=0.5):
-        """Overlay heatmap on original image."""
-        
-        # Convert image to numpy
-        if isinstance(image, torch.Tensor):
-            img = image.squeeze().cpu().numpy()
-            if img.shape[0] == 3:
-                img = img.transpose(1, 2, 0)
-            img = (img - img.min()) / (img.max() - img.min())
-            img = np.uint8(255 * img)
-        else:
-            img = np.array(image)
-        
-        # Ensure img is RGB
-        if len(img.shape) == 2:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-        elif img.shape[2] == 4:
-            img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
-        
-        # Resize heatmap
-        heatmap_resized = cv2.resize(heatmap, (img.shape[1], img.shape[0]))
-        
-        # Convert to heatmap color
-        heatmap_color = np.uint8(255 * heatmap_resized)
-        heatmap_color = cv2.applyColorMap(heatmap_color, cv2.COLORMAP_JET)
-        
-        # Overlay
-        overlayed = cv2.addWeighted(img, 1 - alpha, heatmap_color, alpha, 0)
-        
-        return overlayed, heatmap_resized
 
 def get_layer_5(model):
-    """
-    Get Layer 5 (the 5th Conv2d layer) for Grad-CAM.
-    Layer 5 captures: edges, colors, and basic patterns.
-    """
+    """Get the 5th Conv2d layer for Grad-CAM."""
     
     # Collect all Conv2d layers from vision encoder
     conv_layers = []
@@ -432,9 +398,44 @@ def get_layer_5(model):
         st.info(f"Using Layer {target_index}: {type(conv_layers[target_index]).__name__}")
         return conv_layers[target_index]
     else:
-        # Fallback to last layer if index 5 doesn't exist
         st.warning(f"Layer {target_index} not found. Using last layer (index {len(conv_layers)-1}).")
         return conv_layers[-1]
+
+def create_overlay(image, heatmap, alpha=0.5, target_size=(224, 224)):
+    """Create heatmap overlay without OpenCV."""
+    
+    # Convert image to numpy array
+    if isinstance(image, torch.Tensor):
+        img = image.squeeze().cpu().numpy()
+        if img.shape[0] == 3:
+            img = img.transpose(1, 2, 0)
+        # Denormalize
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+        img = img * std + mean
+        img = np.clip(img, 0, 1)
+    else:
+        img = np.array(image) / 255.0
+        if len(img.shape) == 2:
+            img = np.stack([img, img, img], axis=2)
+        elif img.shape[2] == 4:
+            img = img[:, :, :3]
+    
+    # Resize heatmap to match image
+    from scipy.ndimage import zoom
+    h, w = img.shape[:2]
+    zoom_factors = (h / heatmap.shape[0], w / heatmap.shape[1])
+    heatmap_resized = zoom(heatmap, zoom_factors)
+    heatmap_resized = np.clip(heatmap_resized, 0, 1)
+    
+    # Create RGB heatmap
+    heatmap_rgb = cm.jet(heatmap_resized)[:, :, :3]
+    
+    # Overlay
+    overlay = (1 - alpha) * img + alpha * heatmap_rgb
+    overlay = np.clip(overlay, 0, 1)
+    
+    return overlay, heatmap_resized
 
 def generate_layer5_gradcam(model, image, text_tensor, device, target_class=None):
     """Generate Layer 5 Grad-CAM explanation."""
@@ -457,7 +458,7 @@ def generate_layer5_gradcam(model, image, text_tensor, device, target_class=None
             return None, None
         
         # Create overlay
-        overlay, heatmap_resized = gradcam.overlay_heatmap(
+        overlay, heatmap_resized = create_overlay(
             image, heatmap, alpha=0.6
         )
         
@@ -549,7 +550,7 @@ st.markdown("""
 # HEADER
 # ============================================================================
 
-st.markdown('<div class="main-header">🎨 Emotion Analysis from Children\'s Drawings</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header">Emotion Analysis from Children\'s Drawings</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | Layer 5 Grad-CAM + LIME Explainability</div>', unsafe_allow_html=True)
 
 # ============================================================================
@@ -761,7 +762,7 @@ with col2:
                         st.pyplot(fig)
                         plt.close()
                         
-                        st.caption("🟡 Yellow/Red areas = Regions most important for the prediction")
+                        st.caption("Yellow/Red areas = Regions most important for the prediction")
                         st.info("Layer 5 captures early visual features like edges, colors, and simple patterns that form the building blocks of the drawing.")
                     else:
                         st.info("Layer 5 Grad-CAM explanation not available")
