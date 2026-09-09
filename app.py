@@ -1,7 +1,6 @@
 """
-Multi-Method Grad-CAM Streamlit App
-Model: MobileNetV2 + BiLSTM (92.69% Validation Accuracy)
-FIXED: All shape mismatches resolved
+Layer-wise Grad-CAM + LIME Streamlit App
+Using the EXACT working approach from your Jupyter cells
 """
 
 import streamlit as st
@@ -11,6 +10,7 @@ import torch.nn.functional as F
 import numpy as np
 import os
 import re
+import cv2
 import gdown
 import requests
 from PIL import Image
@@ -25,7 +25,7 @@ warnings.filterwarnings('ignore')
 # ============================================================================
 
 st.set_page_config(
-    page_title="Emotion Analysis - Multi-Method Grad-CAM",
+    page_title="Emotion Analysis - Grad-CAM + LIME",
     page_icon="🎨",
     layout="wide"
 )
@@ -44,11 +44,15 @@ st.markdown("""
     .confidence-fill.sad { background: linear-gradient(90deg, #dc3545, #e74c3c); }
     .stButton button { width: 100%; background: #3498db; color: white; font-weight: 600; padding: 10px; font-size: 1rem; }
     .stButton button:hover { background: #2980b9; }
+    .word-highlight { display: inline-block; padding: 2px 6px; margin: 1px; border-radius: 4px; font-size: 0.9rem; }
+    .word-highlight.high { background: #dc3545; color: white; }
+    .word-highlight.medium { background: #ffc107; color: #333; }
+    .word-highlight.low { background: #e9ecef; color: #333; }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-header">🎨 Emotion Analysis from Children\'s Drawings</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | Multi-Method Explainability</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | Layer-wise Grad-CAM + LIME Explainability</div>', unsafe_allow_html=True)
 
 # ============================================================================
 # GOOGLE DRIVE DOWNLOAD
@@ -90,7 +94,7 @@ def check_files():
     return True
 
 # ============================================================================
-# MODEL COMPONENTS
+# MODEL COMPONENTS - EXACT MATCH TO YOUR CELLS
 # ============================================================================
 
 class BiLSTMTextEncoder(nn.Module):
@@ -140,7 +144,7 @@ def create_text_encoder(text_type, vocab_size, hidden=128):
     raise ValueError(f"Unknown: {text_type}")
 
 # ============================================================================
-# LOAD MODEL
+# LOAD MODEL - EXACTLY LIKE YOUR CELLS
 # ============================================================================
 
 @st.cache_resource
@@ -170,6 +174,7 @@ def load_model():
         model.load_state_dict(state, strict=False)
         model.to(device).eval()
         
+        st.success("✅ Model loaded successfully!")
         return model, vocab, device
         
     except Exception as e:
@@ -177,208 +182,256 @@ def load_model():
         return None, None, None
 
 # ============================================================================
-# EXTRACT ALL CONV LAYERS
+# GET ALL CONV LAYERS - EXACTLY LIKE YOUR CELLS
 # ============================================================================
 
-def get_all_conv_layers(model):
-    """Get all Conv2d layers."""
-    layers = []
-    def traverse(module, prefix=""):
+def get_all_conv_layers(model, max_layers=20):
+    """Extract all convolutional layers from vision encoder - EXACTLY like your cells."""
+    
+    layers = {}
+    layer_count = 0
+    prefix = model.vision
+    
+    def traverse(module, path=""):
+        nonlocal layer_count
+        
         for name, child in module.named_children():
-            full = f"{prefix}.{name}" if prefix else name
+            new_path = f"{path}.{name}" if path else name
+            
             if isinstance(child, nn.Conv2d):
-                layers.append((full, child))
-            traverse(child, full)
-    traverse(model.vision)
+                layer_name = f"Conv_{layer_count}"
+                layers[layer_name] = child
+                layer_count += 1
+                if layer_count >= max_layers:
+                    return
+            
+            traverse(child, new_path)
+    
+    traverse(prefix)
     return layers
 
 # ============================================================================
-# METHOD 1: Vanilla Grad-CAM
+# LAYER-WISE GRAD-CAM - EXACTLY LIKE YOUR CELLS
 # ============================================================================
 
-class GradCAM:
-    def __init__(self, model, target_layer, device):
+class LayerWiseGradCAM:
+    """Grad-CAM across multiple layers - EXACTLY like your cells."""
+    
+    def __init__(self, model, target_layers, device):
         self.model = model
-        self.target_layer = target_layer
+        self.target_layers = target_layers
         self.device = device
-        self.gradients = None
-        self.activations = None
+        self.gradients = {}
+        self.activations = {}
         self._register_hooks()
     
     def _register_hooks(self):
-        def fwd(module, inp, out):
-            self.activations = out
-        def bwd(module, grad_in, grad_out):
-            if grad_out[0] is not None:
-                self.gradients = grad_out[0]
-        self.target_layer.register_forward_hook(fwd)
-        self.target_layer.register_backward_hook(bwd)
+        """Register hooks for all target layers."""
+        for name, layer in self.target_layers.items():
+            def forward_hook(module, input, output, name=name):
+                self.activations[name] = output
+                
+            def backward_hook(module, grad_input, grad_output, name=name):
+                self.gradients[name] = grad_output[0]
+            
+            layer.register_forward_hook(forward_hook)
+            layer.register_backward_hook(backward_hook)
     
-    def generate(self, image, text_tensor, target_class=None):
+    def generate_layer_heatmaps(self, image, text_tensor, target_class=None):
+        """Generate heatmaps for all layers."""
+        
+        self.model.eval()
         self.model.zero_grad()
-        img = image.clone().to(self.device).requires_grad_(True)
-        txt = text_tensor.clone().to(self.device)
-        out = self.model(img, txt)
-        if target_class is None:
-            target_class = torch.argmax(out, dim=1).item()
-        self.model.zero_grad()
-        loss = out[0, target_class]
-        loss.backward()
-        if self.gradients is None or self.activations is None:
-            return None, None
-        weights = torch.mean(self.gradients, dim=(2, 3), keepdim=True)
-        cam = torch.sum(weights * self.activations, dim=1, keepdim=True)
-        cam = F.relu(cam)
-        cam_min, cam_max = torch.min(cam), torch.max(cam)
-        if cam_max - cam_min > 1e-8:
-            cam = (cam - cam_min) / (cam_max - cam_min)
+        
+        # Prepare image with gradient tracking
+        if isinstance(image, torch.Tensor):
+            img = image.clone().to(self.device).requires_grad_(True)
         else:
-            return None, None
-        return cam.squeeze().detach().cpu().numpy(), target_class
-
-# ============================================================================
-# METHOD 2: Guided Backpropagation (FIXED)
-# ============================================================================
-
-class GuidedBackprop:
-    def __init__(self, model, device):
-        self.model = model
-        self.device = device
-        self._register_hooks()
-    
-    def _register_hooks(self):
-        def relu_hook(module, grad_in, grad_out):
-            return (torch.clamp(grad_in[0], min=0),)
-        for module in self.model.vision.modules():
-            if isinstance(module, nn.ReLU):
-                module.register_backward_hook(relu_hook)
-    
-    def generate(self, image, text_tensor, target_class=None):
-        self.model.zero_grad()
-        img = image.clone().to(self.device).requires_grad_(True)
-        txt = text_tensor.clone().to(self.device)
-        out = self.model(img, txt)
+            transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                   std=[0.229, 0.224, 0.225])
+            ])
+            img = transform(image).unsqueeze(0).to(self.device).requires_grad_(True)
+        
+        # Prepare text
+        if text_tensor is None:
+            dummy_text = torch.zeros(1, 50, dtype=torch.long).to(self.device)
+        else:
+            dummy_text = text_tensor.clone().to(self.device)
+        
+        # Forward pass
+        output = self.model(img, dummy_text)
+        
         if target_class is None:
-            target_class = torch.argmax(out, dim=1).item()
+            target_class = torch.argmax(output, dim=1).item()
+        
+        # Backward pass
         self.model.zero_grad()
-        loss = out[0, target_class]
+        loss = output[0, target_class]
         loss.backward()
-        if img.grad is None:
-            return None, None
-        grad = img.grad.squeeze().cpu().detach().numpy()
-        # Handle different shapes
-        if len(grad.shape) == 3 and grad.shape[0] == 3:
-            grad = grad.transpose(1, 2, 0)
-        elif len(grad.shape) == 4:
-            grad = grad[0].transpose(1, 2, 0) if grad.shape[0] == 3 else grad[0]
-        # Ensure 2D or 3D
-        if len(grad.shape) == 3 and grad.shape[2] == 3:
-            pass  # Already RGB
-        elif len(grad.shape) == 2:
-            grad = np.stack([grad, grad, grad], axis=2)
-        grad = np.abs(grad)
-        grad = (grad - grad.min()) / (grad.max() - grad.min() + 1e-8)
-        return grad, target_class
+        
+        # Generate heatmaps for each layer
+        heatmaps = {}
+        
+        for name in self.activations.keys():
+            activations = self.activations[name]
+            gradients = self.gradients[name]
+            
+            # Check if gradients are valid
+            if gradients is None or torch.max(torch.abs(gradients)) < 1e-8:
+                continue
+            
+            # Global average pooling of gradients
+            weights = gradients.mean(dim=(2, 3), keepdim=True)
+            
+            # Weighted combination
+            cam = (weights * activations).sum(dim=1, keepdim=True)
+            cam = F.relu(cam)
+            
+            # Normalize
+            cam = cam - cam.min()
+            cam = cam / (cam.max() + 1e-8)
+            
+            heatmaps[name] = cam.squeeze().cpu().detach().numpy()
+        
+        return heatmaps, target_class
 
 # ============================================================================
-# METHOD 3: Integrated Gradients (FIXED)
+# LIME FOR TEXT - EXACTLY LIKE YOUR CELLS
 # ============================================================================
 
-class IntegratedGradients:
-    def __init__(self, model, device, steps=30):
-        self.model = model
-        self.device = device
-        self.steps = steps
+def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50):
+    """LIME explanation for text - EXACTLY like your cells."""
     
-    def generate(self, image, text_tensor, target_class=None):
-        self.model.zero_grad()
-        img = image.clone().to(self.device)
-        txt = text_tensor.clone().to(self.device)
+    words = text.lower().split()
+    if len(words) == 0:
+        return None, []
+    
+    def preprocess_text(text, word_to_idx, max_len=50):
+        tokens = text.lower().split()
+        token_ids = []
+        for token in tokens:
+            token_ids.append(word_to_idx.get(token, word_to_idx.get('<UNK>', 1)))
+        if len(token_ids) > max_len:
+            token_ids = token_ids[:max_len]
+        else:
+            token_ids = token_ids + [0] * (max_len - len(token_ids))
+        return torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
+    
+    text_tensor = preprocess_text(text, word_to_idx, max_len)
+    text_tensor = text_tensor.to(device)
+    dummy_image = torch.zeros(1, 3, 224, 224).to(device)
+    
+    with torch.no_grad():
+        outputs = model(dummy_image, text_tensor)
+        base_probs = torch.softmax(outputs, dim=1).cpu().numpy()[0]
+        base_pred = np.argmax(base_probs)
+    
+    word_importance = []
+    for i, word in enumerate(words):
+        perturbed_words = words[:i] + words[i+1:]
+        perturbed_text = ' '.join(perturbed_words)
         
-        out = self.model(img, txt)
-        if target_class is None:
-            target_class = torch.argmax(out, dim=1).item()
+        if len(perturbed_text.strip()) == 0:
+            continue
         
-        baseline = torch.zeros_like(img)
-        integrated_grad = torch.zeros_like(img)
+        perturbed_tensor = preprocess_text(perturbed_text, word_to_idx, max_len)
+        perturbed_tensor = perturbed_tensor.to(device)
         
-        for i in range(self.steps):
-            alpha = i / self.steps
-            interpolated = baseline + alpha * (img - baseline)
-            interpolated = interpolated.clone().detach().requires_grad_(True)
-            
-            out = self.model(interpolated, txt)
-            loss = out[0, target_class]
-            
-            self.model.zero_grad()
-            loss.backward()
-            
-            if interpolated.grad is not None:
-                integrated_grad += interpolated.grad / self.steps
+        with torch.no_grad():
+            perturbed_outputs = model(dummy_image, perturbed_tensor)
+            perturbed_probs = torch.softmax(perturbed_outputs, dim=1).cpu().numpy()[0]
         
-        grad_img = integrated_grad.squeeze().cpu().detach().numpy()
-        # Handle different shapes
-        if len(grad_img.shape) == 3 and grad_img.shape[0] == 3:
-            grad_img = grad_img.transpose(1, 2, 0)
-        elif len(grad_img.shape) == 4:
-            grad_img = grad_img[0].transpose(1, 2, 0) if grad_img.shape[0] == 3 else grad_img[0]
-        if len(grad_img.shape) == 3 and grad_img.shape[2] == 3:
-            pass  # Already RGB
-        elif len(grad_img.shape) == 2:
-            grad_img = np.stack([grad_img, grad_img, grad_img], axis=2)
-        grad_img = np.abs(grad_img)
-        grad_img = (grad_img - grad_img.min()) / (grad_img.max() - grad_img.min() + 1e-8)
-        return grad_img, target_class
+        importance = abs(base_probs[base_pred] - perturbed_probs[base_pred])
+        word_importance.append((word, importance))
+    
+    if len(word_importance) > 0:
+        max_imp = max([imp for _, imp in word_importance])
+        if max_imp > 0:
+            word_importance = [(w, imp / max_imp) for w, imp in word_importance]
+    
+    return base_pred, word_importance
 
 # ============================================================================
-# VISUALIZATION (FIXED)
+# VISUALIZATION FUNCTIONS
 # ============================================================================
 
-def resize_array(arr, target_size):
-    """Resize array using PIL."""
-    if len(arr.shape) == 2:
-        arr_uint8 = (arr * 255).astype(np.uint8)
-        arr_pil = Image.fromarray(arr_uint8, mode='L')
-    else:
-        arr_uint8 = (arr * 255).astype(np.uint8)
-        if arr_uint8.shape[2] == 4:
-            arr_uint8 = arr_uint8[:, :, :3]
-        arr_pil = Image.fromarray(arr_uint8)
-    resized = arr_pil.resize(target_size, Image.BILINEAR)
-    return np.array(resized) / 255.0
-
-def get_display_image(image):
-    """Get display-ready image."""
-    if isinstance(image, torch.Tensor):
-        img = image.squeeze().cpu().numpy()
-        if len(img.shape) == 3 and img.shape[0] == 3:
+def visualize_layer_heatmaps(original_image, heatmaps, layer_names, sample_label, sample_id, target_class):
+    """Visualize heatmaps for all layers - EXACTLY like your cells."""
+    
+    if isinstance(original_image, torch.Tensor):
+        img = original_image.squeeze().cpu().numpy()
+        if img.shape[0] == 3:
             img = img.transpose(1, 2, 0)
-        elif len(img.shape) == 4:
-            img = img[0].transpose(1, 2, 0) if img.shape[0] == 3 else img[0]
-        mean, std = np.array([0.485, 0.456, 0.406]), np.array([0.229, 0.224, 0.225])
-        img = np.clip(img * std + mean, 0, 1)
+        img = (img - img.min()) / (img.max() - img.min())
     else:
-        img = np.array(image) / 255.0
-        if len(img.shape) == 2:
-            img = np.stack([img, img, img], axis=2)
-        elif len(img.shape) == 3 and img.shape[2] == 4:
-            img = img[:, :, :3]
-    return img
+        img = np.array(original_image) / 255.0
+    
+    n_layers = len(heatmaps)
+    n_cols = min(4, n_layers + 1)
+    n_rows = (n_layers + 1 + n_cols - 1) // n_cols
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows))
+    axes = axes.flatten() if n_rows * n_cols > 1 else [axes]
+    
+    axes[0].imshow(img)
+    axes[0].set_title(f'Original\n{sample_id}\nLabel: {sample_label}')
+    axes[0].axis('off')
+    
+    for idx, (name, heatmap) in enumerate(heatmaps.items(), 1):
+        if idx >= len(axes):
+            break
+        
+        heatmap_resized = cv2.resize(heatmap, (img.shape[1], img.shape[0]))
+        
+        axes[idx].imshow(img)
+        axes[idx].imshow(heatmap_resized, cmap='jet', alpha=0.5)
+        layer_short = name.replace('Conv_', 'L')
+        axes[idx].set_title(f'{layer_short}\nLayer {idx}')
+        axes[idx].axis('off')
+    
+    for i in range(len(heatmaps) + 1, len(axes)):
+        axes[i].axis('off')
+    
+    class_label = 'Happy' if target_class == 0 else 'Sad'
+    plt.suptitle(f'Layer-wise Grad-CAM: Predicted = {target_class} ({class_label})', fontsize=14)
+    plt.tight_layout()
+    return fig
 
-def overlay_heatmap(image, heatmap, alpha=0.6):
-    """Overlay heatmap on original image."""
-    img = get_display_image(image)
-    h, w = img.shape[0], img.shape[1]
+def visualize_single_layer(original_image, heatmap, layer_name, target_class):
+    """Visualize a single layer heatmap."""
     
-    # Ensure heatmap is 2D
-    if len(heatmap.shape) == 3:
-        heatmap = heatmap.mean(axis=2) if heatmap.shape[2] > 1 else heatmap[:, :, 0]
+    if isinstance(original_image, torch.Tensor):
+        img = original_image.squeeze().cpu().numpy()
+        if img.shape[0] == 3:
+            img = img.transpose(1, 2, 0)
+        img = (img - img.min()) / (img.max() - img.min())
+    else:
+        img = np.array(original_image) / 255.0
     
-    heatmap_resized = resize_array(heatmap, (w, h))
-    heatmap_rgb = cm.jet(heatmap_resized)[:, :, :3]
-    overlay = (1 - alpha) * img + alpha * heatmap_rgb
-    overlay = np.clip(overlay, 0, 1)
-    return overlay, heatmap_resized
+    heatmap_resized = cv2.resize(heatmap, (img.shape[1], img.shape[0]))
+    
+    fig, axes = plt.subplots(1, 3, figsize=(9, 3))
+    
+    axes[0].imshow(img)
+    axes[0].set_title('Original Image')
+    axes[0].axis('off')
+    
+    axes[1].imshow(heatmap_resized, cmap='jet')
+    axes[1].set_title(f'{layer_name} Heatmap')
+    axes[1].axis('off')
+    
+    axes[2].imshow(img)
+    axes[2].imshow(heatmap_resized, cmap='jet', alpha=0.5)
+    axes[2].set_title(f'{layer_name} Overlay')
+    axes[2].axis('off')
+    
+    class_label = 'Happy' if target_class == 0 else 'Sad'
+    plt.suptitle(f'Grad-CAM: Predicted = {target_class} ({class_label})', fontsize=14)
+    plt.tight_layout()
+    return fig
 
 # ============================================================================
 # PREPROCESSING
@@ -406,18 +459,11 @@ model, vocab, device = load_model()
 if model is None:
     st.stop()
 
-# Get all conv layers
-all_layers = get_all_conv_layers(model)
-st.success(f"✅ Model loaded! Found {len(all_layers)} Conv layers")
+# Get all conv layers - EXACTLY like your cells
+all_conv_layers = get_all_conv_layers(model, max_layers=20)
+layer_names = list(all_conv_layers.keys())
 
-# Find Layer 0
-layer0 = None
-for name, layer in all_layers:
-    if name == '0' or name.startswith('0.'):
-        layer0 = layer
-        break
-if layer0 is None and len(all_layers) > 0:
-    layer0 = all_layers[0][1]
+st.success(f"✅ Found {len(all_conv_layers)} convolutional layers")
 
 # ============================================================================
 # UI
@@ -439,13 +485,21 @@ with col1:
     st.subheader("✍️ Self-Reflection")
     text_input = st.text_area("", placeholder="I drew this because I felt...", height=80, label_visibility="collapsed")
     
-    st.subheader("🎯 Select Method")
-    method = st.radio(
-        "Choose explainability method:",
-        ["Grad-CAM (Layer 0)", "Guided Backprop", "Integrated Gradients", "Try All"],
-        index=0,
-        horizontal=True
+    st.subheader("🎯 Select Layer")
+    
+    # Layer selection
+    layer_options = [f"{name} (Layer {i})" for i, name in enumerate(layer_names)]
+    selected_layer_idx = st.selectbox(
+        "Select layer",
+        options=list(range(len(layer_names))),
+        format_func=lambda x: layer_options[x],
+        index=min(5, len(layer_names)-1),
+        label_visibility="collapsed"
     )
+    
+    # Show selected layer info
+    selected_layer_name = layer_names[selected_layer_idx]
+    st.caption(f"Selected: **{selected_layer_name}**")
 
 with col2:
     st.subheader("📊 Results")
@@ -454,6 +508,7 @@ with col2:
     if analyze and uploaded_file is not None and text_input.strip():
         with st.spinner("Analyzing..."):
             try:
+                # Prepare inputs
                 img_tensor = preprocess_image(image)
                 txt_tensor = preprocess_text(text_input, vocab)
                 
@@ -463,6 +518,11 @@ with col2:
                     probs = torch.softmax(out, dim=1)
                     pred = torch.argmax(probs, dim=1).item()
                     conf = probs[0, pred].item()
+                
+                class_names = ['Happy', 'Sad']
+                predicted_class = class_names[pred]
+                happy_pct = probs[0][0].item() * 100
+                sad_pct = probs[0][1].item() * 100
                 
                 # Display prediction
                 if pred == 0:
@@ -480,74 +540,108 @@ with col2:
                     </div>
                     """, unsafe_allow_html=True)
                 
+                # Confidence bars
+                st.markdown("**Confidence Distribution**")
+                col_h, col_s = st.columns(2)
+                with col_h:
+                    st.write("Happy")
+                    st.markdown(f"""
+                    <div class="confidence-bar">
+                        <div class="confidence-fill happy" style="width: {happy_pct:.1f}%;">
+                            {happy_pct:.1f}%
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with col_s:
+                    st.write("Sad")
+                    st.markdown(f"""
+                    <div class="confidence-bar">
+                        <div class="confidence-fill sad" style="width: {sad_pct:.1f}%;">
+                            {sad_pct:.1f}%
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
                 # ============================================================
-                # EXPLANATIONS
+                # GRAD-CAM - Using EXACT method from your cells
                 # ============================================================
                 st.markdown("---")
-                st.markdown("### 🔍 Explainability Results")
+                st.markdown("### 🔍 Layer-wise Grad-CAM")
                 
-                # Define methods to try
-                methods_to_try = []
-                if method == "Grad-CAM (Layer 0)":
-                    if layer0 is not None:
-                        methods_to_try = [("Grad-CAM", GradCAM(model, layer0, device))]
-                elif method == "Guided Backprop":
-                    methods_to_try = [("Guided Backprop", GuidedBackprop(model, device))]
-                elif method == "Integrated Gradients":
-                    methods_to_try = [("Integrated Gradients", IntegratedGradients(model, device, steps=25))]
-                else:  # Try All
-                    if layer0 is not None:
-                        methods_to_try.append(("Grad-CAM", GradCAM(model, layer0, device)))
-                    methods_to_try.append(("Guided Backprop", GuidedBackprop(model, device)))
-                    methods_to_try.append(("Integrated Gradients", IntegratedGradients(model, device, steps=25)))
+                # Select only a few layers for visualization (to avoid cluttering)
+                selected_layers = {}
+                for i, name in enumerate(layer_names[:8]):  # First 8 layers
+                    if name in all_conv_layers:
+                        selected_layers[name] = all_conv_layers[name]
                 
-                # Try each method
-                success_count = 0
-                for method_name, method_obj in methods_to_try:
-                    try:
-                        if isinstance(method_obj, GradCAM):
-                            heatmap, target = method_obj.generate(img_tensor, txt_tensor, target_class=pred)
-                        else:
-                            heatmap, target = method_obj.generate(img_tensor, txt_tensor, target_class=pred)
+                # Initialize Layer-Wise Grad-CAM
+                layer_cam = LayerWiseGradCAM(model, selected_layers, device)
+                
+                # Generate heatmaps
+                heatmaps, target_class = layer_cam.generate_layer_heatmaps(img_tensor, txt_tensor, target_class=pred)
+                
+                if heatmaps:
+                    # Show all layers
+                    fig = visualize_layer_heatmaps(
+                        image, heatmaps, list(heatmaps.keys()),
+                        predicted_class, "Sample", target_class
+                    )
+                    st.pyplot(fig)
+                    plt.close()
+                    
+                    st.caption("🟡 Yellow/Red areas = Regions most important for the prediction")
+                    
+                    # Show activation stats
+                    st.markdown("**Layer Activation Statistics:**")
+                    stats_data = []
+                    for name, heatmap in heatmaps.items():
+                        stats_data.append({
+                            'Layer': name,
+                            'Max': f"{np.max(heatmap):.3f}",
+                            'Mean': f"{np.mean(heatmap):.3f}",
+                            'Std': f"{np.std(heatmap):.3f}"
+                        })
+                    st.table(stats_data)
+                    
+                else:
+                    st.warning("⚠️ Grad-CAM could not be generated for this sample.")
+                    st.info("💡 Try a different image or text input.")
+                
+                # ============================================================
+                # LIME - Text Explanation
+                # ============================================================
+                st.markdown("### 📝 LIME: Text Explanation")
+                
+                if text_input.strip():
+                    base_pred, word_importance = generate_lime_text_explanation(
+                        text_input, model, vocab, device, max_len=50
+                    )
+                    
+                    if word_importance and len(word_importance) > 0:
+                        highlighted_words = []
+                        for word, importance in word_importance:
+                            if importance > 0.7:
+                                cls = "high"
+                            elif importance > 0.4:
+                                cls = "medium"
+                            else:
+                                cls = "low"
+                            highlighted_words.append(f'<span class="word-highlight {cls}">{word}</span>')
                         
-                        if heatmap is not None and np.max(heatmap) > 0.01:
-                            # Enhance for Grad-CAM
-                            if method_name == "Grad-CAM":
-                                heatmap = np.power(heatmap, 0.6)
-                            
-                            # Ensure heatmap is 2D
-                            if len(heatmap.shape) == 3:
-                                heatmap = np.mean(heatmap, axis=2)
-                            
-                            overlay, hm = overlay_heatmap(image, heatmap, alpha=0.6)
-                            
-                            fig, axes = plt.subplots(1, 2, figsize=(8, 4))
-                            
-                            axes[0].imshow(hm, cmap='jet')
-                            axes[0].set_title(f"{method_name}\nHeatmap", fontsize=10)
-                            axes[0].axis('off')
-                            
-                            axes[1].imshow(overlay)
-                            axes[1].set_title(f"{method_name}\nOverlay", fontsize=10)
-                            axes[1].axis('off')
-                            
-                            plt.tight_layout()
-                            st.pyplot(fig)
-                            plt.close()
-                            
-                            st.caption(f"✅ {method_name} - Max: {np.max(heatmap):.3f} | Mean: {np.mean(heatmap):.3f}")
-                            success_count += 1
-                            
-                    except Exception as e:
-                        st.warning(f"⚠️ {method_name} failed: {e}")
-                
-                if success_count == 0:
-                    st.error("❌ All explainability methods failed. Please try:")
-                    st.markdown("""
-                    1. A different image with clearer features
-                    2. Longer text input
-                    3. Try the 'Try All' option
-                    """)
+                        st.markdown(
+                            f'<div style="padding: 10px; background: #f8f9fa; border-radius: 8px; font-size: 0.95rem; line-height: 1.8;">'
+                            f'{" ".join(highlighted_words)}'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                        
+                        st.caption("🔴 High importance | 🟡 Medium | ⚪ Low")
+                        class_names_expl = ['Happy', 'Sad']
+                        st.caption(f"Text-based prediction: {class_names_expl[base_pred]}")
+                    else:
+                        st.info("LIME explanation not available for this text")
+                else:
+                    st.info("No text provided for LIME explanation")
                 
             except Exception as e:
                 st.error(f"Error: {e}")
@@ -564,4 +658,4 @@ with col2:
 # ============================================================================
 
 st.markdown("---")
-st.caption("MobileNetV2 + BiLSTM | Multi-Method Explainability | 92.69% Val Accuracy")
+st.caption("MobileNetV2 + BiLSTM | Layer-wise Grad-CAM + LIME | 92.69% Val Accuracy")
