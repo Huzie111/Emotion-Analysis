@@ -502,25 +502,8 @@ with col2:
                     st.pyplot(fig)
                     plt.close()
                     
-                    # Heatmap statistics
-                    col_a, col_b, col_c = st.columns(3)
-                    with col_a:
-                        st.metric("Max Activation", f"{np.max(heatmap):.3f}")
-                    with col_b:
-                        st.metric("Mean Activation", f"{np.mean(heatmap):.3f}")
-                    with col_c:
-                        st.metric("Std Deviation", f"{np.std(heatmap):.3f}")
                     
-                    st.caption("Yellow/Red areas = Regions most important for the prediction")
-                    
-                    # Layer description
-                    st.info("""
-                    **Layer 50** is a late convolutional layer that captures:
-                    - High-level visual concepts
-                    - Complex patterns and shapes
-                    - Emotion-relevant regions
-                    - Semantic features
-                    """)
+                
                 else:
                     st.warning("Layer 50 Grad-CAM could not be generated.")
                     st.info("Try a different image or text input.")
