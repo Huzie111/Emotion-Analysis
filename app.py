@@ -1,7 +1,7 @@
 """
 Multi-Method Grad-CAM Streamlit App
 Model: MobileNetV2 + BiLSTM (92.69% Validation Accuracy)
-Tries multiple Grad-CAM methods until one works
+FIXED: All shape mismatches resolved
 """
 
 import streamlit as st
@@ -237,7 +237,7 @@ class GradCAM:
         return cam.squeeze().detach().cpu().numpy(), target_class
 
 # ============================================================================
-# METHOD 2: Guided Backpropagation
+# METHOD 2: Guided Backpropagation (FIXED)
 # ============================================================================
 
 class GuidedBackprop:
@@ -266,18 +266,26 @@ class GuidedBackprop:
         if img.grad is None:
             return None, None
         grad = img.grad.squeeze().cpu().detach().numpy()
-        if grad.shape[0] == 3:
+        # Handle different shapes
+        if len(grad.shape) == 3 and grad.shape[0] == 3:
             grad = grad.transpose(1, 2, 0)
+        elif len(grad.shape) == 4:
+            grad = grad[0].transpose(1, 2, 0) if grad.shape[0] == 3 else grad[0]
+        # Ensure 2D or 3D
+        if len(grad.shape) == 3 and grad.shape[2] == 3:
+            pass  # Already RGB
+        elif len(grad.shape) == 2:
+            grad = np.stack([grad, grad, grad], axis=2)
         grad = np.abs(grad)
         grad = (grad - grad.min()) / (grad.max() - grad.min() + 1e-8)
         return grad, target_class
 
 # ============================================================================
-# METHOD 3: Integrated Gradients (Simplified)
+# METHOD 3: Integrated Gradients (FIXED)
 # ============================================================================
 
 class IntegratedGradients:
-    def __init__(self, model, device, steps=50):
+    def __init__(self, model, device, steps=30):
         self.model = model
         self.device = device
         self.steps = steps
@@ -291,10 +299,7 @@ class IntegratedGradients:
         if target_class is None:
             target_class = torch.argmax(out, dim=1).item()
         
-        # Create baseline (black image)
         baseline = torch.zeros_like(img)
-        
-        # Integrate gradients
         integrated_grad = torch.zeros_like(img)
         
         for i in range(self.steps):
@@ -308,44 +313,67 @@ class IntegratedGradients:
             self.model.zero_grad()
             loss.backward()
             
-            integrated_grad += interpolated.grad / self.steps
+            if interpolated.grad is not None:
+                integrated_grad += interpolated.grad / self.steps
         
-        # Convert to visualization
         grad_img = integrated_grad.squeeze().cpu().detach().numpy()
-        if grad_img.shape[0] == 3:
+        # Handle different shapes
+        if len(grad_img.shape) == 3 and grad_img.shape[0] == 3:
             grad_img = grad_img.transpose(1, 2, 0)
+        elif len(grad_img.shape) == 4:
+            grad_img = grad_img[0].transpose(1, 2, 0) if grad_img.shape[0] == 3 else grad_img[0]
+        if len(grad_img.shape) == 3 and grad_img.shape[2] == 3:
+            pass  # Already RGB
+        elif len(grad_img.shape) == 2:
+            grad_img = np.stack([grad_img, grad_img, grad_img], axis=2)
         grad_img = np.abs(grad_img)
         grad_img = (grad_img - grad_img.min()) / (grad_img.max() - grad_img.min() + 1e-8)
-        
         return grad_img, target_class
 
 # ============================================================================
-# VISUALIZATION
+# VISUALIZATION (FIXED)
 # ============================================================================
 
 def resize_array(arr, target_size):
     """Resize array using PIL."""
-    arr_uint8 = (arr * 255).astype(np.uint8)
     if len(arr.shape) == 2:
+        arr_uint8 = (arr * 255).astype(np.uint8)
         arr_pil = Image.fromarray(arr_uint8, mode='L')
     else:
+        arr_uint8 = (arr * 255).astype(np.uint8)
+        if arr_uint8.shape[2] == 4:
+            arr_uint8 = arr_uint8[:, :, :3]
         arr_pil = Image.fromarray(arr_uint8)
     resized = arr_pil.resize(target_size, Image.BILINEAR)
     return np.array(resized) / 255.0
 
-def overlay_heatmap(image, heatmap, alpha=0.6):
+def get_display_image(image):
+    """Get display-ready image."""
     if isinstance(image, torch.Tensor):
         img = image.squeeze().cpu().numpy()
-        if img.shape[0] == 3:
+        if len(img.shape) == 3 and img.shape[0] == 3:
             img = img.transpose(1, 2, 0)
+        elif len(img.shape) == 4:
+            img = img[0].transpose(1, 2, 0) if img.shape[0] == 3 else img[0]
         mean, std = np.array([0.485, 0.456, 0.406]), np.array([0.229, 0.224, 0.225])
         img = np.clip(img * std + mean, 0, 1)
     else:
         img = np.array(image) / 255.0
         if len(img.shape) == 2:
             img = np.stack([img, img, img], axis=2)
-    
+        elif len(img.shape) == 3 and img.shape[2] == 4:
+            img = img[:, :, :3]
+    return img
+
+def overlay_heatmap(image, heatmap, alpha=0.6):
+    """Overlay heatmap on original image."""
+    img = get_display_image(image)
     h, w = img.shape[0], img.shape[1]
+    
+    # Ensure heatmap is 2D
+    if len(heatmap.shape) == 3:
+        heatmap = heatmap.mean(axis=2) if heatmap.shape[2] > 1 else heatmap[:, :, 0]
+    
     heatmap_resized = resize_array(heatmap, (w, h))
     heatmap_rgb = cm.jet(heatmap_resized)[:, :, :3]
     overlay = (1 - alpha) * img + alpha * heatmap_rgb
@@ -381,6 +409,15 @@ if model is None:
 # Get all conv layers
 all_layers = get_all_conv_layers(model)
 st.success(f"✅ Model loaded! Found {len(all_layers)} Conv layers")
+
+# Find Layer 0
+layer0 = None
+for name, layer in all_layers:
+    if name == '0' or name.startswith('0.'):
+        layer0 = layer
+        break
+if layer0 is None and len(all_layers) > 0:
+    layer0 = all_layers[0][1]
 
 # ============================================================================
 # UI
@@ -447,31 +484,22 @@ with col2:
                 # EXPLANATIONS
                 # ============================================================
                 st.markdown("---")
-                st.markdown("### 🔍 Explainability")
+                st.markdown("### 🔍 Explainability Results")
                 
-                # Find Layer 0
-                layer0 = None
-                for name, layer in all_layers:
-                    if '0' in name and name.count('.') == 1:
-                        layer0 = layer
-                        break
-                if layer0 is None:
-                    layer0 = all_layers[0][1]
-                
-                # Try methods based on selection
+                # Define methods to try
                 methods_to_try = []
                 if method == "Grad-CAM (Layer 0)":
-                    methods_to_try = [("Grad-CAM", GradCAM(model, layer0, device))]
+                    if layer0 is not None:
+                        methods_to_try = [("Grad-CAM", GradCAM(model, layer0, device))]
                 elif method == "Guided Backprop":
                     methods_to_try = [("Guided Backprop", GuidedBackprop(model, device))]
                 elif method == "Integrated Gradients":
-                    methods_to_try = [("Integrated Gradients", IntegratedGradients(model, device, steps=30))]
+                    methods_to_try = [("Integrated Gradients", IntegratedGradients(model, device, steps=25))]
                 else:  # Try All
-                    methods_to_try = [
-                        ("Grad-CAM", GradCAM(model, layer0, device)),
-                        ("Guided Backprop", GuidedBackprop(model, device)),
-                        ("Integrated Gradients", IntegratedGradients(model, device, steps=30))
-                    ]
+                    if layer0 is not None:
+                        methods_to_try.append(("Grad-CAM", GradCAM(model, layer0, device)))
+                    methods_to_try.append(("Guided Backprop", GuidedBackprop(model, device)))
+                    methods_to_try.append(("Integrated Gradients", IntegratedGradients(model, device, steps=25)))
                 
                 # Try each method
                 success_count = 0
@@ -482,21 +510,25 @@ with col2:
                         else:
                             heatmap, target = method_obj.generate(img_tensor, txt_tensor, target_class=pred)
                         
-                        if heatmap is not None:
-                            # Enhance heatmap
+                        if heatmap is not None and np.max(heatmap) > 0.01:
+                            # Enhance for Grad-CAM
                             if method_name == "Grad-CAM":
-                                heatmap = np.power(heatmap, 0.5)
+                                heatmap = np.power(heatmap, 0.6)
+                            
+                            # Ensure heatmap is 2D
+                            if len(heatmap.shape) == 3:
+                                heatmap = np.mean(heatmap, axis=2)
                             
                             overlay, hm = overlay_heatmap(image, heatmap, alpha=0.6)
                             
                             fig, axes = plt.subplots(1, 2, figsize=(8, 4))
                             
                             axes[0].imshow(hm, cmap='jet')
-                            axes[0].set_title(f"{method_name}\nHeatmap")
+                            axes[0].set_title(f"{method_name}\nHeatmap", fontsize=10)
                             axes[0].axis('off')
                             
                             axes[1].imshow(overlay)
-                            axes[1].set_title(f"{method_name}\nOverlay")
+                            axes[1].set_title(f"{method_name}\nOverlay", fontsize=10)
                             axes[1].axis('off')
                             
                             plt.tight_layout()
@@ -510,7 +542,12 @@ with col2:
                         st.warning(f"⚠️ {method_name} failed: {e}")
                 
                 if success_count == 0:
-                    st.error("❌ All explainability methods failed. Try a different image or text.")
+                    st.error("❌ All explainability methods failed. Please try:")
+                    st.markdown("""
+                    1. A different image with clearer features
+                    2. Longer text input
+                    3. Try the 'Try All' option
+                    """)
                 
             except Exception as e:
                 st.error(f"Error: {e}")
