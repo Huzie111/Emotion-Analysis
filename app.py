@@ -1,8 +1,3 @@
-"""
-Layer 50 Grad-CAM + LIME Streamlit App
-Model: MobileNetV2 + BiLSTM (92.69% Validation Accuracy)
-Dedicated Layer 50 for Grad-CAM | LIME for Text Explanation
-"""
 
 import streamlit as st
 import torch
@@ -20,9 +15,7 @@ from matplotlib import cm
 import warnings
 warnings.filterwarnings('ignore')
 
-# ============================================================================
 # PAGE CONFIGURATION
-# ============================================================================
 
 st.set_page_config(
     page_title="Emotion Analysis - Layer 50 Grad-CAM + LIME",
@@ -53,11 +46,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-header">🎨 Emotion Analysis from Children\'s Drawings</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | Layer 50 Grad-CAM + LIME Explainability</div>', unsafe_allow_html=True)
 
-# ============================================================================
+
 # GOOGLE DRIVE DOWNLOAD
-# ============================================================================
 
 MODEL_FILE_ID = "11lYY2-0tXlF4mE1peB2ReQy9bMLlp2mp"
 VOCAB_FILE_ID = "1r2mCVi-tVjeI18P2dBFFdlYAeHNuKnm-"
@@ -66,11 +57,10 @@ VOCAB_FILE_NAME = "vocabulary.pth"
 
 def download_file(file_id, output_path, desc="file"):
     try:
-        st.info(f"📥 Downloading {desc}...")
+        st.info(f" Downloading {desc}...")
         url = f"https://drive.google.com/uc?id={file_id}"
         gdown.download(url, output_path, quiet=False)
         if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            st.success(f"✅ {desc} downloaded!")
             return True
     except:
         try:
@@ -94,9 +84,7 @@ def check_files():
         if not download_file(VOCAB_FILE_ID, VOCAB_FILE_NAME, "vocabulary"): return False
     return True
 
-# ============================================================================
 # MODEL COMPONENTS
-# ============================================================================
 
 class BiLSTMTextEncoder(nn.Module):
     def __init__(self, vocab_size, embed_dim=300, hidden=128, dropout=0.7):
@@ -144,9 +132,7 @@ def create_text_encoder(text_type, vocab_size, hidden=128):
     if text_type == 'bilstm': return BiLSTMTextEncoder(vocab_size, hidden=hidden)
     raise ValueError(f"Unknown: {text_type}")
 
-# ============================================================================
 # LOAD MODEL
-# ============================================================================
 
 @st.cache_resource
 def load_model():
@@ -175,16 +161,13 @@ def load_model():
         model.load_state_dict(state, strict=False)
         model.to(device).eval()
         
-        st.success("✅ Model loaded successfully!")
         return model, vocab, device
         
     except Exception as e:
-        st.error(f"❌ Load failed: {e}")
+        st.error(f" Load failed: {e}")
         return None, None, None
 
-# ============================================================================
 # GET LAYER 50
-# ============================================================================
 
 def get_layer_50(model):
     """Get Layer 50 (Conv_50) from the vision encoder."""
@@ -211,9 +194,7 @@ def get_layer_50(model):
         st.warning(f"⚠️ Only {len(conv_layers)} layers found. Using last layer.")
         return conv_layers[-1]
 
-# ============================================================================
 # RESIZE HEATMAP USING PIL
-# ============================================================================
 
 def resize_heatmap_pil(heatmap, target_size):
     """Resize heatmap using PIL."""
@@ -227,9 +208,7 @@ def resize_heatmap_pil(heatmap, target_size):
     
     return heatmap_resized
 
-# ============================================================================
 # LAYER 50 GRAD-CAM
-# ============================================================================
 
 class Layer50GradCAM:
     """Grad-CAM specifically for Layer 50."""
@@ -300,9 +279,7 @@ class Layer50GradCAM:
         
         return cam.squeeze().cpu().detach().numpy()
 
-# ============================================================================
 # LIME FOR TEXT EXPLANATION
-# ============================================================================
 
 def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50):
     """LIME explanation for text."""
@@ -356,9 +333,7 @@ def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50)
     
     return base_pred, word_importance
 
-# ============================================================================
 # VISUALIZATION FUNCTIONS
-# ============================================================================
 
 def visualize_layer50_heatmap(original_image, heatmap, layer_name, target_class):
     """Visualize Layer 50 heatmap."""
@@ -400,9 +375,7 @@ def visualize_layer50_heatmap(original_image, heatmap, layer_name, target_class)
     plt.tight_layout()
     return fig
 
-# ============================================================================
 # PREPROCESSING
-# ============================================================================
 
 def preprocess_image(img):
     transform = transforms.Compose([
@@ -418,9 +391,7 @@ def preprocess_text(text, vocab, max_len=50):
     ids += [0] * (max_len - len(ids))
     return torch.tensor(ids, dtype=torch.long).unsqueeze(0)
 
-# ============================================================================
 # MAIN APP
-# ============================================================================
 
 model, vocab, device = load_model()
 if model is None:
@@ -432,16 +403,13 @@ layer_50_layer = layer_50_info['layer']
 layer_50_name = layer_50_info['name']
 layer_50_index = layer_50_info['index']
 
-st.success(f"✅ Layer 50 found: {layer_50_name} (Index: {layer_50_index})")
 
-# ============================================================================
 # UI
-# ============================================================================
 
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    st.subheader("📤 Upload Drawing")
+    st.subheader(" Upload Drawing")
     uploaded_file = st.file_uploader("", type=['png', 'jpg', 'jpeg'], label_visibility="collapsed")
     
     if uploaded_file is not None:
@@ -451,10 +419,9 @@ with col1:
         st.info("Upload a drawing (JPG/PNG)")
         image = None
     
-    st.subheader("✍️ Self-Reflection Text")
+    st.subheader(" Self-Reflection Text")
     text_input = st.text_area(
         "",
-        placeholder="Example: I drew this because I felt very happy today...",
         height=100,
         label_visibility="collapsed"
     )
@@ -462,8 +429,8 @@ with col1:
     st.caption("Enter the child's self-reflection about their drawing")
 
 with col2:
-    st.subheader("📊 Analysis Results")
-    analyze = st.button("🔍 Analyze Emotion", type="primary", use_container_width=True)
+    st.subheader(" Analysis Results")
+    analyze = st.button(" Analyze Emotion", type="primary", use_container_width=True)
     
     if analyze and uploaded_file is not None and text_input.strip():
         with st.spinner("Analyzing..."):
@@ -471,9 +438,7 @@ with col2:
                 img_tensor = preprocess_image(image)
                 txt_tensor = preprocess_text(text_input, vocab)
                 
-                # ============================================================
                 # PREDICTION
-                # ============================================================
                 with torch.no_grad():
                     out = model(img_tensor.to(device), txt_tensor.to(device))
                     probs = torch.softmax(out, dim=1)
@@ -489,14 +454,14 @@ with col2:
                 if pred == 0:
                     st.markdown(f"""
                     <div class="result-box happy">
-                        <h2 style="margin:0;">😊 Happy</h2>
+                        <h2 style="margin:0;"> Happy</h2>
                         <p style="font-size:1.2rem;margin:0;">Confidence: {conf*100:.1f}%</p>
                     </div>
                     """, unsafe_allow_html=True)
                 else:
                     st.markdown(f"""
                     <div class="result-box sad">
-                        <h2 style="margin:0;">😢 Sad</h2>
+                        <h2 style="margin:0;"> Sad</h2>
                         <p style="font-size:1.2rem;margin:0;">Confidence: {conf*100:.1f}%</p>
                     </div>
                     """, unsafe_allow_html=True)
@@ -523,12 +488,10 @@ with col2:
                     </div>
                     """, unsafe_allow_html=True)
                 
-                # ============================================================
                 # LAYER 50 GRAD-CAM
-                # ============================================================
+
                 st.markdown("---")
-                st.markdown("### 🔍 Layer 50 Grad-CAM Explanation")
-                st.caption(f"Layer: **{layer_50_name}** (Index: {layer_50_index}) - Late convolutional layer capturing high-level emotion-relevant features")
+                st.markdown("Grad-CAM Explanation")
                 
                 # Generate Layer 50 Grad-CAM
                 gradcam = Layer50GradCAM(model, layer_50_layer, device)
@@ -548,7 +511,7 @@ with col2:
                     with col_c:
                         st.metric("Std Deviation", f"{np.std(heatmap):.3f}")
                     
-                    st.caption("🟡 Yellow/Red areas = Regions most important for the prediction")
+                    st.caption("Yellow/Red areas = Regions most important for the prediction")
                     
                     # Layer description
                     st.info("""
@@ -559,14 +522,11 @@ with col2:
                     - Semantic features
                     """)
                 else:
-                    st.warning("⚠️ Layer 50 Grad-CAM could not be generated.")
-                    st.info("💡 Try a different image or text input.")
+                    st.warning("Layer 50 Grad-CAM could not be generated.")
+                    st.info("Try a different image or text input.")
                 
-                # ============================================================
                 # LIME TEXT EXPLANATION
-                # ============================================================
-                st.markdown("### 📝 LIME: Text Explanation")
-                st.caption("Shows which words in the self-reflection most influenced the prediction")
+                st.markdown("LIME: Text Explanation")
                 
                 base_pred, word_importance = generate_lime_text_explanation(
                     text_input, model, vocab, device, max_len=50
@@ -591,7 +551,7 @@ with col2:
                         unsafe_allow_html=True
                     )
                     
-                    st.caption("🔴 High importance | 🟡 Medium | ⚪ Low")
+                    st.caption("High importance | Medium | Low")
                     
                     # Show text-based prediction
                     class_names_expl = ['Happy', 'Sad']
@@ -606,40 +566,9 @@ with col2:
     
     elif analyze:
         if uploaded_file is None:
-            st.warning("⚠️ Please upload a drawing")
+            st.warning(" Please upload a drawing")
         if not text_input.strip():
-            st.warning("⚠️ Please enter self-reflection text")
+            st.warning(" Please enter self-reflection text")
 
-# ============================================================================
-# SIDEBAR INFO
-# ============================================================================
 
-with st.sidebar:
-    st.header("ℹ️ About")
-    st.markdown("""
-    **XAI Methods Used:**
-    
-    1. **Layer 50 Grad-CAM** (Visual)
-       - Identifies regions in the drawing that influenced the prediction
-       - Layer 50 is a late convolutional layer
-       - Captures high-level emotion-relevant features
-    
-    2. **LIME** (Textual)
-       - Shows which words in the self-reflection were most important
-       - Highlights words by importance level
-       - Explains text-based prediction
-    """)
-    
-    st.subheader("📊 Model Performance")
-    st.metric("Validation Accuracy", "92.69%")
-    st.metric("Test Accuracy", "~92.0%")
-    
-    st.subheader("📌 Note")
-    st.info("This tool is for research purposes only. Do not replace professional psychological assessment.")
 
-# ============================================================================
-# FOOTER
-# ============================================================================
-
-st.markdown("---")
-st.caption(f"MobileNetV2 + BiLSTM | Layer 50 Grad-CAM + LIME | 92.69% Val Accuracy | Layer Index: {layer_50_index}")
