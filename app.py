@@ -1,7 +1,7 @@
 """
-Layer 0 Grad-CAM Streamlit App
+Multi-Method Grad-CAM Streamlit App
 Model: MobileNetV2 + BiLSTM (92.69% Validation Accuracy)
-USES ONLY LAYER 0 - The ONLY layer with proper gradients for Grad-CAM
+Tries multiple Grad-CAM methods until one works
 """
 
 import streamlit as st
@@ -25,7 +25,7 @@ warnings.filterwarnings('ignore')
 # ============================================================================
 
 st.set_page_config(
-    page_title="Emotion Analysis - L0 Grad-CAM",
+    page_title="Emotion Analysis - Multi-Method Grad-CAM",
     page_icon="🎨",
     layout="wide"
 )
@@ -48,7 +48,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-header">🎨 Emotion Analysis from Children\'s Drawings</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | L0 Grad-CAM Explainability</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | Multi-Method Explainability</div>', unsafe_allow_html=True)
 
 # ============================================================================
 # GOOGLE DRIVE DOWNLOAD
@@ -170,7 +170,6 @@ def load_model():
         model.load_state_dict(state, strict=False)
         model.to(device).eval()
         
-        st.success("✅ Model loaded successfully!")
         return model, vocab, device
         
     except Exception as e:
@@ -178,31 +177,30 @@ def load_model():
         return None, None, None
 
 # ============================================================================
-# GET LAYER 0 (The ONLY layer with proper gradients)
+# EXTRACT ALL CONV LAYERS
 # ============================================================================
 
-def get_layer0(model):
-    """Get Layer 0 (features.0.0) - the first Conv2d layer."""
-    for name, child in model.vision.named_children():
-        if name == '0':
-            return child
-    # Fallback: find first Conv2d
-    for module in model.vision.modules():
-        if isinstance(module, nn.Conv2d):
-            return module
-    return None
+def get_all_conv_layers(model):
+    """Get all Conv2d layers."""
+    layers = []
+    def traverse(module, prefix=""):
+        for name, child in module.named_children():
+            full = f"{prefix}.{name}" if prefix else name
+            if isinstance(child, nn.Conv2d):
+                layers.append((full, child))
+            traverse(child, full)
+    traverse(model.vision)
+    return layers
 
 # ============================================================================
-# L0 GRAD-CAM
+# METHOD 1: Vanilla Grad-CAM
 # ============================================================================
 
-class L0GradCAM:
-    """Grad-CAM using Layer 0 (features.0.0)."""
-    
-    def __init__(self, model, device):
+class GradCAM:
+    def __init__(self, model, target_layer, device):
         self.model = model
+        self.target_layer = target_layer
         self.device = device
-        self.target_layer = get_layer0(model)
         self.gradients = None
         self.activations = None
         self._register_hooks()
@@ -216,134 +214,126 @@ class L0GradCAM:
         self.target_layer.register_forward_hook(fwd)
         self.target_layer.register_backward_hook(bwd)
     
-    def generate_heatmap(self, image, text_tensor, target_class=None):
-        self.model.eval()
+    def generate(self, image, text_tensor, target_class=None):
         self.model.zero_grad()
-        
-        self.gradients = None
-        self.activations = None
-        
-        try:
-            # Forward pass with gradient tracking
-            img = image.clone().to(self.device).requires_grad_(True)
-            txt = text_tensor.clone().to(self.device)
-            
-            output = self.model(img, txt)
-            
-            if target_class is None:
-                target_class = torch.argmax(output, dim=1).item()
-            
-            # Backward
-            self.model.zero_grad()
-            loss = output[0, target_class]
-            loss.backward()
-            
-            # Check if we got gradients and activations
-            if self.gradients is None or self.activations is None:
-                return None, None
-            
-            if torch.max(torch.abs(self.gradients)) < 1e-8:
-                return None, None
-            
-            # Generate heatmap
-            weights = torch.mean(self.gradients, dim=(2, 3), keepdim=True)
-            cam = torch.sum(weights * self.activations, dim=1, keepdim=True)
-            cam = F.relu(cam)
-            
-            # Normalize
-            cam_min, cam_max = torch.min(cam), torch.max(cam)
-            if cam_max - cam_min > 1e-8:
-                cam = (cam - cam_min) / (cam_max - cam_min)
-            else:
-                return None, None
-            
-            heatmap = cam.squeeze().detach().cpu().numpy()
-            
-            # Validate
-            if np.max(heatmap) < 0.01:
-                return None, None
-            
-            return heatmap, target_class
-            
-        except Exception as e:
-            print(f"Grad-CAM error: {e}")
+        img = image.clone().to(self.device).requires_grad_(True)
+        txt = text_tensor.clone().to(self.device)
+        out = self.model(img, txt)
+        if target_class is None:
+            target_class = torch.argmax(out, dim=1).item()
+        self.model.zero_grad()
+        loss = out[0, target_class]
+        loss.backward()
+        if self.gradients is None or self.activations is None:
             return None, None
+        weights = torch.mean(self.gradients, dim=(2, 3), keepdim=True)
+        cam = torch.sum(weights * self.activations, dim=1, keepdim=True)
+        cam = F.relu(cam)
+        cam_min, cam_max = torch.min(cam), torch.max(cam)
+        if cam_max - cam_min > 1e-8:
+            cam = (cam - cam_min) / (cam_max - cam_min)
+        else:
+            return None, None
+        return cam.squeeze().detach().cpu().numpy(), target_class
 
 # ============================================================================
-# GUIDED BACKPROPAGATION (Alternative for deeper layers)
+# METHOD 2: Guided Backpropagation
 # ============================================================================
 
 class GuidedBackprop:
-    """Guided Backpropagation for deeper layer visualization."""
-    
     def __init__(self, model, device):
         self.model = model
         self.device = device
         self._register_hooks()
     
     def _register_hooks(self):
-        def relu_backward_hook(module, grad_in, grad_out):
-            # Only keep positive gradients
+        def relu_hook(module, grad_in, grad_out):
             return (torch.clamp(grad_in[0], min=0),)
-        
-        # Register hooks for all ReLU layers
         for module in self.model.vision.modules():
             if isinstance(module, nn.ReLU):
-                module.register_backward_hook(relu_backward_hook)
+                module.register_backward_hook(relu_hook)
     
     def generate(self, image, text_tensor, target_class=None):
-        self.model.eval()
         self.model.zero_grad()
+        img = image.clone().to(self.device).requires_grad_(True)
+        txt = text_tensor.clone().to(self.device)
+        out = self.model(img, txt)
+        if target_class is None:
+            target_class = torch.argmax(out, dim=1).item()
+        self.model.zero_grad()
+        loss = out[0, target_class]
+        loss.backward()
+        if img.grad is None:
+            return None, None
+        grad = img.grad.squeeze().cpu().detach().numpy()
+        if grad.shape[0] == 3:
+            grad = grad.transpose(1, 2, 0)
+        grad = np.abs(grad)
+        grad = (grad - grad.min()) / (grad.max() - grad.min() + 1e-8)
+        return grad, target_class
+
+# ============================================================================
+# METHOD 3: Integrated Gradients (Simplified)
+# ============================================================================
+
+class IntegratedGradients:
+    def __init__(self, model, device, steps=50):
+        self.model = model
+        self.device = device
+        self.steps = steps
+    
+    def generate(self, image, text_tensor, target_class=None):
+        self.model.zero_grad()
+        img = image.clone().to(self.device)
+        txt = text_tensor.clone().to(self.device)
         
-        try:
-            img = image.clone().to(self.device).requires_grad_(True)
-            txt = text_tensor.clone().to(self.device)
+        out = self.model(img, txt)
+        if target_class is None:
+            target_class = torch.argmax(out, dim=1).item()
+        
+        # Create baseline (black image)
+        baseline = torch.zeros_like(img)
+        
+        # Integrate gradients
+        integrated_grad = torch.zeros_like(img)
+        
+        for i in range(self.steps):
+            alpha = i / self.steps
+            interpolated = baseline + alpha * (img - baseline)
+            interpolated = interpolated.clone().detach().requires_grad_(True)
             
-            output = self.model(img, txt)
-            
-            if target_class is None:
-                target_class = torch.argmax(output, dim=1).item()
+            out = self.model(interpolated, txt)
+            loss = out[0, target_class]
             
             self.model.zero_grad()
-            loss = output[0, target_class]
             loss.backward()
             
-            # Get gradients
-            gradients = img.grad
-            
-            if gradients is None:
-                return None, None
-            
-            # Convert to visualization
-            grad_img = gradients.squeeze().cpu().detach().numpy()
-            if grad_img.shape[0] == 3:
-                grad_img = grad_img.transpose(1, 2, 0)
-            
-            # Normalize
-            grad_img = np.abs(grad_img)
-            grad_img = (grad_img - grad_img.min()) / (grad_img.max() - grad_img.min() + 1e-8)
-            
-            return grad_img, target_class
-            
-        except Exception as e:
-            print(f"Guided Backprop error: {e}")
-            return None, None
+            integrated_grad += interpolated.grad / self.steps
+        
+        # Convert to visualization
+        grad_img = integrated_grad.squeeze().cpu().detach().numpy()
+        if grad_img.shape[0] == 3:
+            grad_img = grad_img.transpose(1, 2, 0)
+        grad_img = np.abs(grad_img)
+        grad_img = (grad_img - grad_img.min()) / (grad_img.max() - grad_img.min() + 1e-8)
+        
+        return grad_img, target_class
 
 # ============================================================================
-# RESIZE HEATMAP
+# VISUALIZATION
 # ============================================================================
 
-def resize_heatmap_pil(heatmap, target_size):
-    """Resize heatmap using PIL."""
-    heatmap_uint8 = (heatmap * 255).astype(np.uint8)
-    heatmap_pil = Image.fromarray(heatmap_uint8, mode='L')
-    heatmap_resized = heatmap_pil.resize(target_size, Image.BILINEAR)
-    return np.array(heatmap_resized) / 255.0
+def resize_array(arr, target_size):
+    """Resize array using PIL."""
+    arr_uint8 = (arr * 255).astype(np.uint8)
+    if len(arr.shape) == 2:
+        arr_pil = Image.fromarray(arr_uint8, mode='L')
+    else:
+        arr_pil = Image.fromarray(arr_uint8)
+    resized = arr_pil.resize(target_size, Image.BILINEAR)
+    return np.array(resized) / 255.0
 
 def overlay_heatmap(image, heatmap, alpha=0.6):
-    """Overlay heatmap on original image."""
-    
-    # Convert image
     if isinstance(image, torch.Tensor):
         img = image.squeeze().cpu().numpy()
         if img.shape[0] == 3:
@@ -356,17 +346,10 @@ def overlay_heatmap(image, heatmap, alpha=0.6):
             img = np.stack([img, img, img], axis=2)
     
     h, w = img.shape[0], img.shape[1]
-    
-    # Resize heatmap
-    heatmap_resized = resize_heatmap_pil(heatmap, (w, h))
-    
-    # Create RGB heatmap
+    heatmap_resized = resize_array(heatmap, (w, h))
     heatmap_rgb = cm.jet(heatmap_resized)[:, :, :3]
-    
-    # Overlay
     overlay = (1 - alpha) * img + alpha * heatmap_rgb
     overlay = np.clip(overlay, 0, 1)
-    
     return overlay, heatmap_resized
 
 # ============================================================================
@@ -395,13 +378,9 @@ model, vocab, device = load_model()
 if model is None:
     st.stop()
 
-# Verify Layer 0 exists
-layer0 = get_layer0(model)
-if layer0 is None:
-    st.error("❌ Layer 0 not found!")
-    st.stop()
-
-st.success("✅ Layer 0 (features.0.0) found for Grad-CAM")
+# Get all conv layers
+all_layers = get_all_conv_layers(model)
+st.success(f"✅ Model loaded! Found {len(all_layers)} Conv layers")
 
 # ============================================================================
 # UI
@@ -422,6 +401,14 @@ with col1:
     
     st.subheader("✍️ Self-Reflection")
     text_input = st.text_area("", placeholder="I drew this because I felt...", height=80, label_visibility="collapsed")
+    
+    st.subheader("🎯 Select Method")
+    method = st.radio(
+        "Choose explainability method:",
+        ["Grad-CAM (Layer 0)", "Guided Backprop", "Integrated Gradients", "Try All"],
+        index=0,
+        horizontal=True
+    )
 
 with col2:
     st.subheader("📊 Results")
@@ -430,7 +417,6 @@ with col2:
     if analyze and uploaded_file is not None and text_input.strip():
         with st.spinner("Analyzing..."):
             try:
-                # Prepare inputs
                 img_tensor = preprocess_image(image)
                 txt_tensor = preprocess_text(text_input, vocab)
                 
@@ -458,80 +444,73 @@ with col2:
                     """, unsafe_allow_html=True)
                 
                 # ============================================================
-                # L0 GRAD-CAM - FORCES RED REGIONS
+                # EXPLANATIONS
                 # ============================================================
                 st.markdown("---")
-                st.markdown("### 🔍 L0 Grad-CAM Explanation")
-                st.caption("Layer 0 (features.0.0) - Detects basic edges, colors, and simple patterns")
+                st.markdown("### 🔍 Explainability")
                 
-                gradcam = L0GradCAM(model, device)
-                heatmap, target = gradcam.generate_heatmap(img_tensor, txt_tensor, target_class=pred)
+                # Find Layer 0
+                layer0 = None
+                for name, layer in all_layers:
+                    if '0' in name and name.count('.') == 1:
+                        layer0 = layer
+                        break
+                if layer0 is None:
+                    layer0 = all_layers[0][1]
                 
-                if heatmap is not None:
-                    # Force heatmap to show red regions (amplify)
-                    heatmap = np.power(heatmap, 0.5)  # Gamma adjustment to enhance
-                    
-                    overlay, hm = overlay_heatmap(image, heatmap, alpha=0.6)
-                    
-                    fig, axes = plt.subplots(1, 3, figsize=(9, 3))
-                    
-                    axes[0].imshow(image.resize((224, 224)))
-                    axes[0].set_title("Original Drawing")
-                    axes[0].axis('off')
-                    
-                    axes[1].imshow(hm, cmap='jet')
-                    axes[1].set_title("L0 Heatmap")
-                    axes[1].axis('off')
-                    
-                    axes[2].imshow(overlay)
-                    axes[2].set_title("L0 Overlay")
-                    axes[2].axis('off')
-                    
-                    plt.tight_layout()
-                    st.pyplot(fig)
-                    plt.close()
-                    
-                    # Show stats
-                    col_a, col_b, col_c = st.columns(3)
-                    with col_a:
-                        st.metric("Max Activation", f"{np.max(heatmap):.3f}")
-                    with col_b:
-                        st.metric("Mean Activation", f"{np.mean(heatmap):.3f}")
-                    with col_c:
-                        st.metric("Red Region %", f"{np.sum(heatmap > 0.5) / heatmap.size * 100:.1f}%")
-                    
-                    st.caption("🟡 Yellow/Red areas = Basic features (edges, colors, simple patterns) that influenced the prediction")
-                    
-                else:
-                    st.warning("⚠️ L0 Grad-CAM could not be generated.")
-                    st.info("💡 Try a different image with clearer features")
+                # Try methods based on selection
+                methods_to_try = []
+                if method == "Grad-CAM (Layer 0)":
+                    methods_to_try = [("Grad-CAM", GradCAM(model, layer0, device))]
+                elif method == "Guided Backprop":
+                    methods_to_try = [("Guided Backprop", GuidedBackprop(model, device))]
+                elif method == "Integrated Gradients":
+                    methods_to_try = [("Integrated Gradients", IntegratedGradients(model, device, steps=30))]
+                else:  # Try All
+                    methods_to_try = [
+                        ("Grad-CAM", GradCAM(model, layer0, device)),
+                        ("Guided Backprop", GuidedBackprop(model, device)),
+                        ("Integrated Gradients", IntegratedGradients(model, device, steps=30))
+                    ]
                 
-                # ============================================================
-                # LIME - Text Explanation
-                # ============================================================
-                st.markdown("---")
-                st.markdown("### 📝 LIME: Text Explanation")
+                # Try each method
+                success_count = 0
+                for method_name, method_obj in methods_to_try:
+                    try:
+                        if isinstance(method_obj, GradCAM):
+                            heatmap, target = method_obj.generate(img_tensor, txt_tensor, target_class=pred)
+                        else:
+                            heatmap, target = method_obj.generate(img_tensor, txt_tensor, target_class=pred)
+                        
+                        if heatmap is not None:
+                            # Enhance heatmap
+                            if method_name == "Grad-CAM":
+                                heatmap = np.power(heatmap, 0.5)
+                            
+                            overlay, hm = overlay_heatmap(image, heatmap, alpha=0.6)
+                            
+                            fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+                            
+                            axes[0].imshow(hm, cmap='jet')
+                            axes[0].set_title(f"{method_name}\nHeatmap")
+                            axes[0].axis('off')
+                            
+                            axes[1].imshow(overlay)
+                            axes[1].set_title(f"{method_name}\nOverlay")
+                            axes[1].axis('off')
+                            
+                            plt.tight_layout()
+                            st.pyplot(fig)
+                            plt.close()
+                            
+                            st.caption(f"✅ {method_name} - Max: {np.max(heatmap):.3f} | Mean: {np.mean(heatmap):.3f}")
+                            success_count += 1
+                            
+                    except Exception as e:
+                        st.warning(f"⚠️ {method_name} failed: {e}")
                 
-                try:
-                    # Simple text importance
-                    words = text_input.lower().split()
-                    if words:
-                        st.markdown("**Word Importance Analysis:**")
-                        cols = st.columns(min(4, len(words)))
-                        for i, word in enumerate(words[:12]):
-                            if i < len(cols):
-                                # Simple heuristic: words like "happy", "sad" get high importance
-                                emotion_words = ['happy', 'happiness', 'joy', 'glad', 'sad', 'sadness', 'upset', 'angry']
-                                importance = 0.8 if word in emotion_words else 0.3
-                                color = "#dc3545" if importance > 0.7 else "#ffc107"
-                                with cols[i % len(cols)]:
-                                    st.markdown(
-                                        f'<span style="background: {color}; color: white; padding: 8px 12px; border-radius: 4px; display: inline-block;">{word}</span>',
-                                        unsafe_allow_html=True
-                                    )
-                        st.caption("🔴 High importance | 🟡 Medium importance")
-                except Exception as e:
-                    st.info(f"Text analysis: {e}")
+                if success_count == 0:
+                    st.error("❌ All explainability methods failed. Try a different image or text.")
                 
             except Exception as e:
                 st.error(f"Error: {e}")
@@ -548,4 +527,4 @@ with col2:
 # ============================================================================
 
 st.markdown("---")
-st.caption("MobileNetV2 + BiLSTM | L0 Grad-CAM | 92.69% Val Accuracy")
+st.caption("MobileNetV2 + BiLSTM | Multi-Method Explainability | 92.69% Val Accuracy")
