@@ -1,7 +1,7 @@
 """
 L0 Grad-CAM Streamlit App
 Model: MobileNetV2 + BiLSTM (92.69% Validation Accuracy)
-FIXED: Using Layer 0 (features.0.0) - the only compatible layer
+FIXED: Proper error handling for Grad-CAM
 """
 
 import streamlit as st
@@ -223,59 +223,76 @@ class L0GradCAM:
         self.gradients = None
         self.activations = None
         
-        # Forward pass
-        img = image.clone().to(self.device).requires_grad_(True)
-        txt = text_tensor.clone().to(self.device)
-        
-        output = self.model(img, txt)
-        
-        if target_class is None:
-            target_class = torch.argmax(output, dim=1).item()
-        
-        # Backward
-        self.model.zero_grad()
-        loss = output[0, target_class]
-        loss.backward()
-        
-        if self.gradients is None or self.activations is None:
-            return None
-        
-        if torch.max(torch.abs(self.gradients)) < 1e-8:
-            return None
-        
-        # Generate heatmap
-        weights = torch.mean(self.gradients, dim=(2, 3), keepdim=True)
-        cam = torch.sum(weights * self.activations, dim=1, keepdim=True)
-        cam = F.relu(cam)
-        
-        # Normalize
-        cam_min, cam_max = torch.min(cam), torch.max(cam)
-        if cam_max - cam_min > 1e-8:
-            cam = (cam - cam_min) / (cam_max - cam_min)
-        else:
-            cam = torch.zeros_like(cam)
-        
-        return cam.squeeze().detach().cpu().numpy(), target_class
+        try:
+            # Forward pass
+            img = image.clone().to(self.device).requires_grad_(True)
+            txt = text_tensor.clone().to(self.device)
+            
+            output = self.model(img, txt)
+            
+            if target_class is None:
+                target_class = torch.argmax(output, dim=1).item()
+            
+            # Backward
+            self.model.zero_grad()
+            loss = output[0, target_class]
+            loss.backward()
+            
+            # Check if we got gradients and activations
+            if self.gradients is None or self.activations is None:
+                return None, None
+            
+            if torch.max(torch.abs(self.gradients)) < 1e-8:
+                return None, None
+            
+            # Generate heatmap
+            weights = torch.mean(self.gradients, dim=(2, 3), keepdim=True)
+            cam = torch.sum(weights * self.activations, dim=1, keepdim=True)
+            cam = F.relu(cam)
+            
+            # Normalize
+            cam_min, cam_max = torch.min(cam), torch.max(cam)
+            if cam_max - cam_min > 1e-8:
+                cam = (cam - cam_min) / (cam_max - cam_min)
+            else:
+                return None, None
+            
+            heatmap = cam.squeeze().detach().cpu().numpy()
+            
+            # Validate
+            if np.max(heatmap) < 0.01:
+                return None, None
+            
+            return heatmap, target_class
+            
+        except Exception as e:
+            print(f"Grad-CAM error: {e}")
+            return None, None
 
 def overlay_heatmap(image, heatmap, alpha=0.6):
-    if isinstance(image, torch.Tensor):
-        img = image.squeeze().detach().cpu().numpy()
-        if img.shape[0] == 3:
-            img = img.transpose(1, 2, 0)
-        mean, std = np.array([0.485, 0.456, 0.406]), np.array([0.229, 0.224, 0.225])
-        img = np.clip(img * std + mean, 0, 1)
-    else:
-        img = np.array(image) / 255.0
-    
-    h, w = img.shape[0], img.shape[1]
-    heatmap = np.array(Image.fromarray(heatmap).resize((w, h)))
-    heatmap = np.clip(heatmap, 0, 1)
-    
-    heatmap_rgb = cm.jet(heatmap)[:, :, :3]
-    overlay = (1 - alpha) * img + alpha * heatmap_rgb
-    overlay = np.clip(overlay, 0, 1)
-    
-    return overlay, heatmap
+    try:
+        if isinstance(image, torch.Tensor):
+            img = image.squeeze().detach().cpu().numpy()
+            if img.shape[0] == 3:
+                img = img.transpose(1, 2, 0)
+            mean, std = np.array([0.485, 0.456, 0.406]), np.array([0.229, 0.224, 0.225])
+            img = np.clip(img * std + mean, 0, 1)
+        else:
+            img = np.array(image) / 255.0
+        
+        h, w = img.shape[0], img.shape[1]
+        
+        # Resize heatmap using PIL
+        heatmap_pil = Image.fromarray((heatmap * 255).astype(np.uint8))
+        heatmap_resized = np.array(heatmap_pil.resize((w, h))) / 255.0
+        
+        heatmap_rgb = cm.jet(heatmap_resized)[:, :, :3]
+        overlay = (1 - alpha) * img + alpha * heatmap_rgb
+        overlay = np.clip(overlay, 0, 1)
+        
+        return overlay, heatmap_resized
+    except Exception as e:
+        return None, None
 
 # ============================================================================
 # PREPROCESSING
@@ -366,52 +383,62 @@ with col2:
                     """, unsafe_allow_html=True)
                 
                 # ============================================================
-                # L0 GRAD-CAM
+                # L0 GRAD-CAM - FIXED WITH PROPER ERROR HANDLING
                 # ============================================================
                 st.markdown("---")
                 st.markdown("### 🔍 L0 Grad-CAM Explanation")
                 st.caption("Layer 0 (features.0.0) - Detects basic edges, colors, and simple patterns")
                 
                 gradcam = L0GradCAM(model, device)
-                heatmap, target = gradcam.generate_heatmap(img_tensor, txt_tensor, target_class=pred)
+                result = gradcam.generate_heatmap(img_tensor, txt_tensor, target_class=pred)
                 
-                if heatmap is not None:
-                    overlay, hm = overlay_heatmap(image, heatmap, alpha=0.6)
+                if result is not None:
+                    heatmap, target = result
                     
-                    fig, axes = plt.subplots(1, 3, figsize=(9, 3))
-                    
-                    axes[0].imshow(image.resize((224, 224)))
-                    axes[0].set_title("Original Drawing")
-                    axes[0].axis('off')
-                    
-                    axes[1].imshow(hm, cmap='jet')
-                    axes[1].set_title("L0 Heatmap")
-                    axes[1].axis('off')
-                    
-                    axes[2].imshow(overlay)
-                    axes[2].set_title("L0 Overlay")
-                    axes[2].axis('off')
-                    
-                    plt.tight_layout()
-                    st.pyplot(fig)
-                    plt.close()
-                    
-                    st.caption("🟡 Yellow/Red areas = Basic features (edges, colors, simple patterns) that influenced the prediction")
-                    
-                    # Stats
-                    col_a, col_b, col_c = st.columns(3)
-                    with col_a:
-                        st.metric("Max Activation", f"{np.max(heatmap):.3f}")
-                    with col_b:
-                        st.metric("Mean Activation", f"{np.mean(heatmap):.3f}")
-                    with col_c:
-                        st.metric("Std Deviation", f"{np.std(heatmap):.3f}")
-                    
-                    st.info("ℹ️ **Layer 0** captures low-level features like edges, colors, and simple patterns. Since MobileNetV2 uses depthwise separable convolutions, only the first layer is compatible with Grad-CAM.")
-                    
+                    if heatmap is not None:
+                        overlay, hm = overlay_heatmap(image, heatmap, alpha=0.6)
+                        
+                        if overlay is not None:
+                            fig, axes = plt.subplots(1, 3, figsize=(9, 3))
+                            
+                            axes[0].imshow(image.resize((224, 224)))
+                            axes[0].set_title("Original Drawing")
+                            axes[0].axis('off')
+                            
+                            axes[1].imshow(hm, cmap='jet')
+                            axes[1].set_title("L0 Heatmap")
+                            axes[1].axis('off')
+                            
+                            axes[2].imshow(overlay)
+                            axes[2].set_title("L0 Overlay")
+                            axes[2].axis('off')
+                            
+                            plt.tight_layout()
+                            st.pyplot(fig)
+                            plt.close()
+                            
+                            st.caption("🟡 Yellow/Red areas = Basic features (edges, colors, simple patterns) that influenced the prediction")
+                            
+                            # Stats
+                            col_a, col_b, col_c = st.columns(3)
+                            with col_a:
+                                st.metric("Max Activation", f"{np.max(heatmap):.3f}")
+                            with col_b:
+                                st.metric("Mean Activation", f"{np.mean(heatmap):.3f}")
+                            with col_c:
+                                st.metric("Std Deviation", f"{np.std(heatmap):.3f}")
+                        else:
+                            st.warning("⚠️ Could not overlay heatmap.")
+                    else:
+                        st.warning("⚠️ Heatmap generation failed. Try a different image.")
                 else:
                     st.warning("⚠️ L0 Grad-CAM could not be generated.")
-                    st.info("💡 Try a different image or text input.")
+                    st.info("💡 Tips:")
+                    st.markdown("""
+                    - Try a different image (clearer drawing)
+                    - Try different text input
+                    - Ensure the image has visible features
+                    """)
                 
             except Exception as e:
                 st.error(f"Error: {e}")
