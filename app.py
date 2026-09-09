@@ -1,7 +1,6 @@
 """
-Complete XAI Techniques Implementation
-All techniques displayed at once for comparison
-FIXED: No Streamlit warnings
+Layer-wise Grad-CAM App (Layers 1-5)
+Simple and clean - only shows 5 layer-wise Grad-CAM visualizations
 """
 
 import streamlit as st
@@ -25,7 +24,7 @@ warnings.filterwarnings('ignore')
 # ============================================================================
 
 st.set_page_config(
-    page_title="Emotion Analysis - All XAI Techniques",
+    page_title="Emotion Analysis - Layer-wise Grad-CAM",
     page_icon="🎨",
     layout="wide"
 )
@@ -44,15 +43,11 @@ st.markdown("""
     .confidence-fill.sad { background: linear-gradient(90deg, #dc3545, #e74c3c); }
     .stButton button { width: 100%; background: #3498db; color: white; font-weight: 600; padding: 10px; font-size: 1rem; }
     .stButton button:hover { background: #2980b9; }
-    .word-highlight { display: inline-block; padding: 2px 6px; margin: 1px; border-radius: 4px; font-size: 0.9rem; }
-    .word-highlight.high { background: #dc3545; color: white; }
-    .word-highlight.medium { background: #ffc107; color: #333; }
-    .word-highlight.low { background: #e9ecef; color: #333; }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-header">🎨 Emotion Analysis from Children\'s Drawings</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | ALL XAI Techniques: Grad-CAM, LIME, SHAP, Saliency, Integrated Gradients</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | Layer-wise Grad-CAM (Layers 1-5)</div>', unsafe_allow_html=True)
 
 # ============================================================================
 # GOOGLE DRIVE DOWNLOAD
@@ -92,29 +87,6 @@ def check_files():
     if not os.path.exists(VOCAB_FILE_NAME):
         if not download_file(VOCAB_FILE_ID, VOCAB_FILE_NAME, "vocabulary"): return False
     return True
-
-# ============================================================================
-# CAPTUM IMPORTS
-# ============================================================================
-
-try:
-    from captum.attr import (
-        LayerGradCam,
-        LayerAttribution,
-        GuidedGradCam,
-        IntegratedGradients,
-        GradientShap,
-        Saliency
-    )
-    CAPTUM_AVAILABLE = True
-except:
-    CAPTUM_AVAILABLE = False
-
-try:
-    from skimage.segmentation import quickshift
-    SKIMAGE_AVAILABLE = True
-except:
-    SKIMAGE_AVAILABLE = False
 
 # ============================================================================
 # MODEL COMPONENTS
@@ -205,360 +177,113 @@ def load_model():
         return None, None, None
 
 # ============================================================================
-# XAI TECHNIQUES IMPLEMENTATION
+# LAYER-WISE GRAD-CAM (Layers 1-5)
 # ============================================================================
 
-class XAIComparison:
-    """Complete XAI Techniques Implementation."""
+def get_conv_layers(model, max_layers=5):
+    """Get first N convolutional layers."""
+    layers = []
     
-    def __init__(self, model, device):
+    def traverse(module, path=""):
+        for name, child in module.named_children():
+            if isinstance(child, nn.Conv2d):
+                layers.append((path + name, child))
+                if len(layers) >= max_layers:
+                    return
+            traverse(child, path + name + ".")
+            if len(layers) >= max_layers:
+                return
+    
+    traverse(model.vision)
+    return layers
+
+class LayerGradCAM:
+    """Grad-CAM for a specific layer."""
+    
+    def __init__(self, model, target_layer, device):
         self.model = model
+        self.target_layer = target_layer
         self.device = device
+        self.gradients = None
+        self.activations = None
+        self._register_hooks()
+    
+    def _register_hooks(self):
+        def forward_hook(module, input, output):
+            self.activations = output
+            
+        def backward_hook(module, grad_input, grad_output):
+            if grad_output[0] is not None:
+                self.gradients = grad_output[0]
+            
+        self.target_layer.register_forward_hook(forward_hook)
+        self.target_layer.register_backward_hook(backward_hook)
+    
+    def generate_heatmap(self, image, text_tensor, target_class=None):
         self.model.eval()
-    
-    def get_target_layer(self):
-        """Find the last convolutional layer for Grad-CAM."""
-        vision = self.model.vision
+        self.model.zero_grad()
         
-        if hasattr(vision, 'features'):
-            if hasattr(vision.features, '_modules'):
-                keys = list(vision.features._modules.keys())
-                if keys:
-                    for key in reversed(keys):
-                        module = vision.features._modules[key]
-                        if isinstance(module, nn.Conv2d):
-                            return module
-                    return vision.features._modules[keys[-1]]
+        self.gradients = None
+        self.activations = None
         
-        for name, module in vision.named_modules():
-            if isinstance(module, nn.Conv2d):
-                return module
+        img = image.clone().to(self.device).requires_grad_(True)
+        txt = text_tensor.clone().to(self.device)
         
-        return vision
-    
-    def normalize_heatmap(self, heatmap):
-        """Normalize heatmap to [0,1] range."""
-        if np.max(heatmap) - np.min(heatmap) > 1e-8:
-            heatmap = (heatmap - np.min(heatmap)) / (np.max(heatmap) - np.min(heatmap) + 1e-8)
+        output = self.model(img, txt)
+        
+        if target_class is None:
+            target_class = torch.argmax(output, dim=1).item()
+        
+        self.model.zero_grad()
+        loss = output[0, target_class]
+        loss.backward()
+        
+        if self.gradients is None or self.activations is None:
+            return None
+        
+        if torch.max(torch.abs(self.gradients)) < 1e-8:
+            return None
+        
+        weights = torch.mean(self.gradients, dim=(2, 3), keepdim=True)
+        cam = torch.sum(weights * self.activations, dim=1, keepdim=True)
+        cam = F.relu(cam)
+        
+        cam_min, cam_max = torch.min(cam), torch.max(cam)
+        if cam_max - cam_min > 1e-8:
+            cam = (cam - cam_min) / (cam_max - cam_min)
         else:
-            heatmap = np.zeros_like(heatmap)
-        return heatmap
+            return None
+        
+        return cam.squeeze().detach().cpu().numpy()
 
-    def get_layerwise_layers(self):
-        """Get multiple layers for layer-wise Grad-CAM."""
-        layer_names = []
-        layers = []
-        
-        vision = self.model.vision
-        
-        if hasattr(vision, 'features'):
-            if hasattr(vision.features, '_modules'):
-                keys = list(vision.features._modules.keys())
-                for idx in [0, len(keys)//4, len(keys)//2, 3*len(keys)//4, -1]:
-                    if idx < len(keys):
-                        module = vision.features._modules[keys[idx]]
-                        if isinstance(module, nn.Conv2d):
-                            layer_names.append(f"Layer_{keys[idx]}")
-                            layers.append(module)
-        
-        if not layers:
-            for name, module in vision.named_modules():
-                if isinstance(module, nn.Conv2d):
-                    layer_names.append(name)
-                    layers.append(module)
-                    if len(layers) >= 5:
-                        break
-        
-        return layers, layer_names
+def resize_heatmap(heatmap, target_size):
+    """Resize heatmap using PIL."""
+    heatmap = heatmap - heatmap.min()
+    heatmap = heatmap / (heatmap.max() + 1e-8)
+    heatmap = (heatmap * 255).astype(np.uint8)
+    
+    heatmap_pil = Image.fromarray(heatmap, mode='L')
+    heatmap_pil = heatmap_pil.resize(target_size, Image.Resampling.BILINEAR)
+    return np.array(heatmap_pil) / 255.0
 
-    def grad_cam(self, image, target_class=0):
-        """Standard Grad-CAM."""
-        if not CAPTUM_AVAILABLE:
-            return np.random.rand(224, 224)
-        
-        try:
-            target_layer = self.get_target_layer()
-            grad_cam = LayerGradCam(self.model, target_layer)
-            dummy_text = torch.zeros(1, 50, dtype=torch.long).to(self.device)
-            
-            attributions = grad_cam.attribute(
-                image, target=target_class, additional_forward_args=(dummy_text,)
-            )
-            
-            if attributions.dim() == 4:
-                heatmap = LayerAttribution.interpolate(attributions, (224, 224))
-            elif attributions.dim() == 3:
-                attributions = attributions.unsqueeze(1)
-                heatmap = LayerAttribution.interpolate(attributions, (224, 224))
-            else:
-                heatmap = torch.ones(1, 1, 224, 224).to(self.device)
-            
-            heatmap = heatmap.squeeze().cpu().detach().numpy()
-            heatmap = self.normalize_heatmap(heatmap)
-            return heatmap
-        except:
-            return np.random.rand(224, 224)
-
-    def guided_grad_cam(self, image, target_class=0):
-        """Guided Grad-CAM."""
-        if not CAPTUM_AVAILABLE:
-            return np.random.rand(224, 224)
-        
-        try:
-            target_layer = self.get_target_layer()
-            grad_cam = LayerGradCam(self.model, target_layer)
-            dummy_text = torch.zeros(1, 50, dtype=torch.long).to(self.device)
-            
-            attributions = grad_cam.attribute(
-                image, target=target_class, additional_forward_args=(dummy_text,)
-            )
-            
-            if attributions.dim() == 4:
-                heatmap = LayerAttribution.interpolate(attributions, (224, 224))
-            elif attributions.dim() == 3:
-                attributions = attributions.unsqueeze(1)
-                heatmap = LayerAttribution.interpolate(attributions, (224, 224))
-            else:
-                heatmap = torch.ones(1, 1, 224, 224).to(self.device)
-            
-            heatmap = heatmap.squeeze().cpu().detach().numpy()
-            heatmap = self.normalize_heatmap(heatmap)
-            
-            guided_grad_cam = GuidedGradCam(self.model, target_layer)
-            guided_attributions = guided_grad_cam.attribute(
-                image, target=target_class, additional_forward_args=(dummy_text,)
-            )
-            
-            if guided_attributions.dim() == 4:
-                guided_heatmap = guided_attributions.squeeze().cpu().detach().numpy()
-                guided_heatmap = np.abs(guided_heatmap).mean(axis=0)
-            elif guided_attributions.dim() == 3:
-                guided_heatmap = guided_attributions.squeeze().cpu().detach().numpy()
-                guided_heatmap = np.abs(guided_heatmap)
-            else:
-                guided_heatmap = np.random.rand(224, 224)
-            
-            guided_heatmap = self.normalize_heatmap(guided_heatmap)
-            
-            combined = heatmap * guided_heatmap
-            combined = self.normalize_heatmap(combined)
-            return combined
-        except:
-            return np.random.rand(224, 224)
-
-    def layerwise_grad_cam(self, image, target_class=0):
-        """Layer-wise Grad-CAM."""
-        heatmaps = []
-        layer_names = []
-        
-        if not CAPTUM_AVAILABLE:
-            return [np.random.rand(224, 224)], ["Layer 0"]
-        
-        try:
-            layers, layer_names = self.get_layerwise_layers()
-            dummy_text = torch.zeros(1, 50, dtype=torch.long).to(self.device)
-            
-            for layer in layers:
-                try:
-                    grad_cam = LayerGradCam(self.model, layer)
-                    attributions = grad_cam.attribute(
-                        image, target=target_class, additional_forward_args=(dummy_text,)
-                    )
-                    
-                    if attributions.dim() == 4:
-                        heatmap = LayerAttribution.interpolate(attributions, (224, 224))
-                    elif attributions.dim() == 3:
-                        attributions = attributions.unsqueeze(1)
-                        heatmap = LayerAttribution.interpolate(attributions, (224, 224))
-                    else:
-                        heatmap = torch.ones(1, 1, 224, 224).to(self.device)
-                    
-                    heatmap = heatmap.squeeze().cpu().detach().numpy()
-                    heatmap = self.normalize_heatmap(heatmap)
-                    heatmaps.append(heatmap)
-                except:
-                    heatmaps.append(np.zeros((224, 224)))
-            
-            return heatmaps, layer_names
-        except:
-            return [np.random.rand(224, 224)], ["Layer 0"]
-
-    def integrated_gradients(self, image, target_class=0):
-        """Integrated Gradients."""
-        if not CAPTUM_AVAILABLE:
-            return np.random.rand(224, 224)
-        
-        try:
-            ig = IntegratedGradients(self.model)
-            dummy_text = torch.zeros(1, 50, dtype=torch.long).to(self.device)
-            baseline_image = torch.zeros_like(image)
-            
-            attributions = ig.attribute(
-                image, baseline_image, target=target_class,
-                additional_forward_args=(dummy_text,), n_steps=30
-            )
-            
-            if attributions.dim() == 4:
-                heatmap = attributions.squeeze().cpu().detach().numpy()
-                heatmap = np.abs(heatmap).mean(axis=0)
-            elif attributions.dim() == 3:
-                heatmap = attributions.squeeze().cpu().detach().numpy()
-                heatmap = np.abs(heatmap)
-            else:
-                heatmap = np.random.rand(224, 224)
-            
-            heatmap = self.normalize_heatmap(heatmap)
-            
-            if heatmap.shape[0] != 224 or heatmap.shape[1] != 224:
-                heatmap = np.array(Image.fromarray(heatmap).resize((224, 224)))
-            
-            return heatmap
-        except:
-            return np.random.rand(224, 224)
-
-    def gradient_shap(self, image, target_class=0):
-        """Gradient SHAP."""
-        if not CAPTUM_AVAILABLE:
-            return np.random.rand(224, 224)
-        
-        try:
-            gs = GradientShap(self.model)
-            dummy_text = torch.zeros(1, 50, dtype=torch.long).to(self.device)
-            baselines = torch.randn(5, *image.shape[1:]).to(self.device)
-            
-            attributions = gs.attribute(
-                image, baselines, target=target_class,
-                additional_forward_args=(dummy_text,), n_samples=15
-            )
-            
-            if attributions.dim() == 4:
-                heatmap = attributions.squeeze().cpu().detach().numpy()
-                heatmap = np.abs(heatmap).mean(axis=0)
-            elif attributions.dim() == 3:
-                heatmap = attributions.squeeze().cpu().detach().numpy()
-                heatmap = np.abs(heatmap)
-            else:
-                heatmap = np.random.rand(224, 224)
-            
-            heatmap = self.normalize_heatmap(heatmap)
-            
-            if heatmap.shape[0] != 224 or heatmap.shape[1] != 224:
-                heatmap = np.array(Image.fromarray(heatmap).resize((224, 224)))
-            
-            return heatmap
-        except:
-            return np.random.rand(224, 224)
-
-    def saliency_maps(self, image, target_class=0):
-        """Saliency maps."""
-        if not CAPTUM_AVAILABLE:
-            return np.random.rand(224, 224)
-        
-        try:
-            saliency = Saliency(self.model)
-            dummy_text = torch.zeros(1, 50, dtype=torch.long).to(self.device)
-            
-            attributions = saliency.attribute(
-                image, target=target_class, additional_forward_args=(dummy_text,)
-            )
-            
-            if attributions.dim() == 4:
-                heatmap = attributions.squeeze().cpu().detach().numpy()
-                heatmap = np.abs(heatmap).mean(axis=0)
-            elif attributions.dim() == 3:
-                heatmap = attributions.squeeze().cpu().detach().numpy()
-                heatmap = np.abs(heatmap)
-            else:
-                heatmap = np.random.rand(224, 224)
-            
-            heatmap = self.normalize_heatmap(heatmap)
-            
-            if heatmap.shape[0] != 224 or heatmap.shape[1] != 224:
-                heatmap = np.array(Image.fromarray(heatmap).resize((224, 224)))
-            
-            return heatmap
-        except:
-            return np.random.rand(224, 224)
-
-    def lime_explanation(self, image_array, target_class=0):
-        """Manual LIME implementation."""
-        if not SKIMAGE_AVAILABLE:
-            return np.random.rand(224, 224)
-        
-        try:
-            if image_array.dtype == np.uint8:
-                image_array = image_array / 255.0
-            
-            segments = quickshift(image_array, kernel_size=4, max_dist=200, ratio=0.2)
-            num_segments = len(np.unique(segments))
-            
-            heatmap = np.zeros(segments.shape)
-            
-            def predict_fn(images):
-                self.model.eval()
-                if isinstance(images, np.ndarray):
-                    images_tensor = torch.from_numpy(images.transpose(0, 3, 1, 2)).float()
-                else:
-                    images_tensor = images
-                images_tensor = images_tensor.to(self.device)
-                batch_size = images_tensor.shape[0]
-                dummy_text = torch.zeros(batch_size, 50, dtype=torch.long).to(self.device)
-                with torch.no_grad():
-                    outputs = self.model(images_tensor, dummy_text)
-                    probs = torch.softmax(outputs, dim=1)
-                return probs.cpu().numpy()
-            
-            base_prob = predict_fn(image_array[np.newaxis, ...])[0][target_class]
-            
-            for seg_id in range(min(num_segments, 20)):
-                mask = segments == seg_id
-                if np.sum(mask) < 10:
-                    continue
-                
-                perturbed = image_array.copy()
-                perturbed[mask] = 0
-                prob = predict_fn(perturbed[np.newaxis, ...])[0][target_class]
-                importance = base_prob - prob
-                heatmap[mask] = importance
-            
-            heatmap = self.normalize_heatmap(heatmap)
-            
-            if heatmap.shape[0] != 224 or heatmap.shape[1] != 224:
-                heatmap = np.array(Image.fromarray(heatmap).resize((224, 224)))
-            
-            return heatmap
-        except:
-            return np.random.rand(224, 224)
-
-    def visualize_all_techniques(self, image_tensor, pil_image, target_class=0):
-        """Generate all XAI techniques."""
-        
-        img_array = np.array(pil_image)
-        if img_array.dtype == np.uint8:
-            img_display = img_array.astype(np.float32) / 255.0
-        else:
-            img_display = img_array.copy()
-            if img_display.max() > 1.0:
-                img_display = img_display / 255.0
-        img_display = np.clip(img_display, 0, 1)
-        
-        techniques = {}
-        
-        techniques['Grad-CAM'] = self.grad_cam(image_tensor, target_class)
-        techniques['Guided Grad-CAM'] = self.guided_grad_cam(image_tensor, target_class)
-        
-        heatmaps, layer_names = self.layerwise_grad_cam(image_tensor, target_class)
-        for i, (hm, name) in enumerate(zip(heatmaps, layer_names)):
-            techniques[f'Layer-wise {i+1}'] = hm
-        
-        techniques['Integrated Gradients'] = self.integrated_gradients(image_tensor, target_class)
-        techniques['Gradient SHAP'] = self.gradient_shap(image_tensor, target_class)
-        techniques['Saliency Maps'] = self.saliency_maps(image_tensor, target_class)
-        
-        img_array_lime = np.array(pil_image).astype(np.float32)
-        techniques['LIME'] = self.lime_explanation(img_array_lime, target_class)
-        
-        return techniques, img_display
+def create_overlay(image, heatmap, alpha=0.5):
+    """Create overlay of heatmap on image."""
+    
+    if isinstance(image, torch.Tensor):
+        img = image.squeeze().cpu().numpy()
+        if img.shape[0] == 3:
+            img = img.transpose(1, 2, 0)
+        mean, std = np.array([0.485, 0.456, 0.406]), np.array([0.229, 0.224, 0.225])
+        img = np.clip(img * std + mean, 0, 1)
+    else:
+        img = np.array(image) / 255.0
+    
+    h, w = img.shape[0], img.shape[1]
+    heatmap_resized = resize_heatmap(heatmap, (w, h))
+    
+    heatmap_rgb = cm.jet(heatmap_resized)[:, :, :3]
+    overlay = (1 - alpha) * img + alpha * heatmap_rgb
+    return np.clip(overlay, 0, 1)
 
 # ============================================================================
 # PREPROCESSING
@@ -578,58 +303,6 @@ def preprocess_text(text, vocab, max_len=50):
     ids += [0] * (max_len - len(ids))
     return torch.tensor(ids, dtype=torch.long).unsqueeze(0)
 
-def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50):
-    """LIME explanation for text."""
-    
-    words = text.lower().split()
-    if len(words) == 0:
-        return None, []
-    
-    def preprocess_text(text, word_to_idx, max_len=50):
-        tokens = text.lower().split()
-        token_ids = []
-        for token in tokens:
-            token_ids.append(word_to_idx.get(token, word_to_idx.get('<UNK>', 1)))
-        if len(token_ids) > max_len:
-            token_ids = token_ids[:max_len]
-        else:
-            token_ids = token_ids + [0] * (max_len - len(token_ids))
-        return torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
-    
-    text_tensor = preprocess_text(text, word_to_idx, max_len)
-    text_tensor = text_tensor.to(device)
-    dummy_image = torch.zeros(1, 3, 224, 224).to(device)
-    
-    with torch.no_grad():
-        outputs = model(dummy_image, text_tensor)
-        base_probs = torch.softmax(outputs, dim=1).cpu().numpy()[0]
-        base_pred = np.argmax(base_probs)
-    
-    word_importance = []
-    for i, word in enumerate(words):
-        perturbed_words = words[:i] + words[i+1:]
-        perturbed_text = ' '.join(perturbed_words)
-        
-        if len(perturbed_text.strip()) == 0:
-            continue
-        
-        perturbed_tensor = preprocess_text(perturbed_text, word_to_idx, max_len)
-        perturbed_tensor = perturbed_tensor.to(device)
-        
-        with torch.no_grad():
-            perturbed_outputs = model(dummy_image, perturbed_tensor)
-            perturbed_probs = torch.softmax(perturbed_outputs, dim=1).cpu().numpy()[0]
-        
-        importance = abs(base_probs[base_pred] - perturbed_probs[base_pred])
-        word_importance.append((word, importance))
-    
-    if len(word_importance) > 0:
-        max_imp = max([imp for _, imp in word_importance])
-        if max_imp > 0:
-            word_importance = [(w, imp / max_imp) for w, imp in word_importance]
-    
-    return base_pred, word_importance
-
 # ============================================================================
 # MAIN APP
 # ============================================================================
@@ -638,10 +311,12 @@ model, vocab, device = load_model()
 if model is None:
     st.stop()
 
-st.success("✅ Model loaded successfully!")
+# Get first 5 conv layers
+conv_layers = get_conv_layers(model, max_layers=5)
+st.success(f"✅ Found {len(conv_layers)} convolutional layers for Grad-CAM")
 
 # ============================================================================
-# UI - NO EMPTY LABELS
+# UI
 # ============================================================================
 
 col1, col2 = st.columns([1, 1])
@@ -672,10 +347,10 @@ with col1:
 with col2:
     st.subheader("📊 Results")
     
-    analyze = st.button("🔍 Analyze with All XAI Techniques", type="primary", use_container_width=True)
+    analyze = st.button("🔍 Analyze with Layer-wise Grad-CAM", type="primary", use_container_width=True)
     
     if analyze and uploaded_file is not None and text_input.strip():
-        with st.spinner("Generating all XAI techniques..."):
+        with st.spinner("Generating Layer-wise Grad-CAM..."):
             try:
                 img_tensor = preprocess_image(image)
                 txt_tensor = preprocess_text(text_input, vocab)
@@ -731,84 +406,74 @@ with col2:
                     """, unsafe_allow_html=True)
                 
                 # ============================================================
-                # XAI TECHNIQUES
+                # LAYER-WISE GRAD-CAM (Layers 1-5)
                 # ============================================================
                 st.markdown("---")
-                st.markdown("### 🔬 ALL XAI TECHNIQUES")
+                st.markdown("### 🔍 Layer-wise Grad-CAM (Layers 1-5)")
+                st.caption("Each layer shows different levels of feature abstraction")
                 
-                xai = XAIComparison(model, device)
-                techniques, img_display = xai.visualize_all_techniques(
-                    img_tensor.to(device), image, target_class=pred
-                )
+                # Generate heatmaps for each layer
+                heatmaps = []
+                layer_names = []
                 
-                # Display all techniques in grid
-                n_techniques = len(techniques) + 1
-                cols = 4
-                rows = (n_techniques + cols - 1) // cols
+                for idx, (layer_name, layer) in enumerate(conv_layers):
+                    try:
+                        gradcam = LayerGradCAM(model, layer, device)
+                        heatmap = gradcam.generate_heatmap(img_tensor, txt_tensor, target_class=pred)
+                        
+                        if heatmap is not None and np.max(heatmap) > 0.01:
+                            heatmaps.append(heatmap)
+                            layer_names.append(f"Layer {idx+1}")
+                        else:
+                            heatmaps.append(None)
+                            layer_names.append(f"Layer {idx+1} (No gradients)")
+                    except Exception as e:
+                        heatmaps.append(None)
+                        layer_names.append(f"Layer {idx+1} (Error)")
                 
-                fig, axes = plt.subplots(rows, cols, figsize=(20, 5*rows))
-                axes = axes.flatten()
+                # Display layers in a grid (2 rows x 3 columns)
+                cols_per_row = 3
+                num_layers = len(conv_layers)
+                num_rows = (num_layers + cols_per_row - 1) // cols_per_row
                 
-                # Original image
-                axes[0].imshow(img_display)
-                axes[0].set_title('Original Image', fontsize=12, fontweight='bold')
-                axes[0].axis('off')
-                
-                # Plot each technique
-                for i, (name, heatmap) in enumerate(techniques.items(), 1):
-                    if i >= len(axes):
-                        break
-                    ax = axes[i]
-                    ax.imshow(img_display, alpha=0.5)
-                    ax.imshow(heatmap, cmap='jet', alpha=0.5)
-                    ax.set_title(name, fontsize=10, fontweight='bold')
-                    ax.axis('off')
-                
-                for j in range(len(techniques) + 1, len(axes)):
-                    axes[j].axis('off')
-                
-                plt.suptitle(f'XAI Techniques Comparison - Target: {predicted_class}', 
-                             fontsize=16, fontweight='bold')
-                plt.tight_layout()
-                st.pyplot(fig)
-                plt.close()
-                
-                # ============================================================
-                # LIME Text Explanation
-                # ============================================================
-                st.markdown("---")
-                st.markdown("### 📝 LIME: Text Explanation")
-                
-                if text_input.strip():
-                    base_pred, word_importance = generate_lime_text_explanation(
-                        text_input, model, vocab, device, max_len=50
-                    )
-                    
-                    if word_importance and len(word_importance) > 0:
-                        highlighted_words = []
-                        for word, importance in word_importance:
-                            if importance > 0.7:
-                                cls = "high"
-                            elif importance > 0.4:
-                                cls = "medium"
+                for row in range(num_rows):
+                    cols = st.columns(cols_per_row)
+                    for col_idx in range(cols_per_row):
+                        layer_idx = row * cols_per_row + col_idx
+                        if layer_idx >= num_layers:
+                            break
+                        
+                        with cols[col_idx]:
+                            heatmap = heatmaps[layer_idx]
+                            layer_name = layer_names[layer_idx]
+                            
+                            if heatmap is not None:
+                                # Create overlay
+                                overlay = create_overlay(image, heatmap, alpha=0.5)
+                                
+                                fig, axes = plt.subplots(1, 2, figsize=(6, 3))
+                                
+                                axes[0].imshow(overlay)
+                                axes[0].set_title(f'{layer_name}\nOverlay')
+                                axes[0].axis('off')
+                                
+                                # Heatmap only
+                                h, w = overlay.shape[0], overlay.shape[1]
+                                heatmap_resized = resize_heatmap(heatmap, (w, h))
+                                axes[1].imshow(heatmap_resized, cmap='jet')
+                                axes[1].set_title(f'{layer_name}\nHeatmap')
+                                axes[1].axis('off')
+                                
+                                plt.tight_layout()
+                                st.pyplot(fig)
+                                plt.close()
+                                
+                                # Show stats
+                                st.caption(f"Max: {np.max(heatmap):.3f} | Mean: {np.mean(heatmap):.3f}")
                             else:
-                                cls = "low"
-                            highlighted_words.append(f'<span class="word-highlight {cls}">{word}</span>')
-                        
-                        st.markdown(
-                            f'<div style="padding: 10px; background: #f8f9fa; border-radius: 8px; font-size: 0.95rem; line-height: 1.8;">'
-                            f'{" ".join(highlighted_words)}'
-                            f'</div>',
-                            unsafe_allow_html=True
-                        )
-                        
-                        st.caption("🔴 High importance | 🟡 Medium | ⚪ Low")
-                        class_names_expl = ['Happy', 'Sad']
-                        st.caption(f"Text-based prediction: {class_names_expl[base_pred]}")
-                    else:
-                        st.info("LIME explanation not available for this text")
-                else:
-                    st.info("No text provided for LIME explanation")
+                                st.info(f"❌ {layer_name}: No gradients available")
+                
+                st.caption("🟡 Yellow/Red areas = Regions most important for the prediction")
                 
             except Exception as e:
                 st.error(f"Error: {e}")
@@ -825,4 +490,4 @@ with col2:
 # ============================================================================
 
 st.markdown("---")
-st.caption("MobileNetV2 + BiLSTM | All XAI Techniques: Grad-CAM, Guided Grad-CAM, Layer-wise, Integrated Gradients, Gradient SHAP, Saliency, LIME | 92.69% Val Accuracy")
+st.caption("MobileNetV2 + BiLSTM | Layer-wise Grad-CAM (Layers 1-5) | 92.69% Val Accuracy")
