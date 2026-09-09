@@ -1,7 +1,7 @@
 """
 L32 Layer-Wise Grad-CAM Streamlit App
 Model: MobileNetV2 + BiLSTM (92.69% Validation Accuracy)
-Files are downloaded from Google Drive automatically
+FIXED: Filters only valid convolutional layers with spatial dimensions
 """
 
 import streamlit as st
@@ -101,24 +101,19 @@ st.markdown("""
     .stButton button:hover {
         background: #2980b9;
     }
-    .word-highlight {
-        display: inline-block;
-        padding: 2px 6px;
-        margin: 1px;
-        border-radius: 4px;
-        font-size: 0.9rem;
+    .layer-selector {
+        background: #f8f9fa;
+        padding: 15px;
+        border-radius: 8px;
+        border: 1px solid #e9ecef;
+        margin: 10px 0;
     }
-    .word-highlight.high {
-        background: #dc3545;
-        color: white;
+    .valid-layer {
+        color: #28a745;
+        font-weight: bold;
     }
-    .word-highlight.medium {
-        background: #ffc107;
-        color: #333;
-    }
-    .word-highlight.low {
-        background: #e9ecef;
-        color: #333;
+    .invalid-layer {
+        color: #dc3545;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -134,7 +129,6 @@ st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | Layer-wise Grad-CAM 
 # GOOGLE DRIVE DOWNLOAD FUNCTIONS
 # ============================================================================
 
-# Google Drive File IDs
 MODEL_FILE_ID = "11lYY2-0tXlF4mE1peB2ReQy9bMLlp2mp"
 VOCAB_FILE_ID = "1r2mCVi-tVjeI18P2dBFFdlYAeHNuKnm-"
 
@@ -142,12 +136,7 @@ MODEL_FILE_NAME = "MM_MobileNetV2_BiLSTM_final.pt"
 VOCAB_FILE_NAME = "vocabulary.pth"
 
 def download_file_from_drive(file_id, output_path, description="file"):
-    """
-    Download a file from Google Drive using gdown with fallback to requests.
-    """
-    
     try:
-        # Try gdown first
         st.info(f"📥 Downloading {description} from Google Drive...")
         url = f"https://drive.google.com/uc?id={file_id}"
         gdown.download(url, output_path, quiet=False)
@@ -160,13 +149,11 @@ def download_file_from_drive(file_id, output_path, description="file"):
     except Exception as e:
         st.warning(f"⚠️ gdown failed: {e}")
         
-        # Try with requests fallback
         try:
             url = f"https://drive.google.com/uc?export=download&id={file_id}"
             session = requests.Session()
             response = session.get(url, stream=True)
             
-            # Handle confirmation token
             if 'confirm' in response.text:
                 confirm_match = re.search(r'confirm=([^&]+)', response.text)
                 if confirm_match:
@@ -190,9 +177,6 @@ def download_file_from_drive(file_id, output_path, description="file"):
             return False
 
 def check_and_download_files():
-    """Check if files exist, download if missing."""
-    
-    # Check model file
     if not os.path.exists(MODEL_FILE_NAME):
         st.info("📥 Model file not found. Downloading from Google Drive...")
         success = download_file_from_drive(MODEL_FILE_ID, MODEL_FILE_NAME, "model")
@@ -202,7 +186,6 @@ def check_and_download_files():
     else:
         st.success(f"✅ Model file found: {MODEL_FILE_NAME} ({os.path.getsize(MODEL_FILE_NAME)/1024/1024:.1f} MB)")
     
-    # Check vocabulary file
     if not os.path.exists(VOCAB_FILE_NAME):
         st.info("📥 Vocabulary file not found. Downloading from Google Drive...")
         success = download_file_from_drive(VOCAB_FILE_ID, VOCAB_FILE_NAME, "vocabulary")
@@ -215,7 +198,7 @@ def check_and_download_files():
     return True
 
 # ============================================================================
-# MODEL COMPONENTS - EXACT MATCH TO TRAINING
+# MODEL COMPONENTS
 # ============================================================================
 
 class BiLSTMTextEncoder(nn.Module):
@@ -236,8 +219,6 @@ class BiLSTMTextEncoder(nn.Module):
         return context
 
 def get_vision_encoder(name, pretrained=False):
-    """Get vision encoder - matches training architecture exactly."""
-    
     backbones = {
         'mobilenet_v2': (models.mobilenet_v2, 1280),
         'efficientnet_b0': (models.efficientnet_b0, 1280),
@@ -251,7 +232,6 @@ def get_vision_encoder(name, pretrained=False):
     model_fn, dim = backbones[name]
     model = model_fn(pretrained=pretrained)
     
-    # Remove classification head
     if hasattr(model, 'classifier'):
         model.classifier = nn.Identity()
     elif hasattr(model, 'fc'):
@@ -262,15 +242,11 @@ def get_vision_encoder(name, pretrained=False):
     return model, dim
 
 class MultimodalModel(nn.Module):
-    """Multimodal model - EXACT match to training."""
-    
     def __init__(self, vision_name, text_encoder, dropout=0.7):
         super().__init__()
         
-        # Vision encoder
         self.vision, vdim = get_vision_encoder(vision_name, pretrained=False)
         
-        # Vision projection
         self.vision_proj = nn.Sequential(
             nn.Linear(vdim, 512),
             nn.BatchNorm1d(512),
@@ -278,10 +254,8 @@ class MultimodalModel(nn.Module):
             nn.Dropout(dropout)
         )
         
-        # Text encoder
         self.text_encoder = text_encoder
         
-        # Text projection
         self.text_proj = nn.Sequential(
             nn.Linear(text_encoder.output_dim, 256),
             nn.BatchNorm1d(256),
@@ -289,7 +263,6 @@ class MultimodalModel(nn.Module):
             nn.Dropout(dropout)
         )
         
-        # Fusion + Classifier
         fusion_dim = 512 + 256
         self.classifier = nn.Sequential(
             nn.Linear(fusion_dim, 256),
@@ -304,24 +277,18 @@ class MultimodalModel(nn.Module):
         )
         
     def forward(self, images, texts):
-        # Vision path
         v = self.vision(images)
         if v.dim() > 2:
             v = v.view(v.size(0), -1)
         v = self.vision_proj(v)
         
-        # Text path
         t = self.text_encoder(texts)
         t = self.text_proj(t)
         
-        # Fusion
         fused = torch.cat([v, t], dim=1)
-        
-        # Classification
         return self.classifier(fused)
 
 def create_text_encoder(text_type, vocab_size, hidden=128):
-    """Create text encoder based on type."""
     if text_type == 'bilstm':
         return BiLSTMTextEncoder(vocab_size, hidden=hidden)
     else:
@@ -333,14 +300,10 @@ def create_text_encoder(text_type, vocab_size, hidden=128):
 
 @st.cache_resource
 def load_model_and_vocab():
-    """Load the trained model and vocabulary from Google Drive."""
-    
-    # Check and download files
     if not check_and_download_files():
         return None, None, None
     
     try:
-        # Load vocabulary
         vocab_data = torch.load(VOCAB_FILE_NAME, map_location='cpu')
         if isinstance(vocab_data, dict):
             word_to_idx = vocab_data.get('word_to_idx', vocab_data)
@@ -353,27 +316,18 @@ def load_model_and_vocab():
         return None, None, None
     
     try:
-        # Device
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        # Create text encoder
         text_enc = create_text_encoder('bilstm', vocab_size, hidden=128)
-        
-        # Create model
         model = MultimodalModel('mobilenet_v2', text_enc)
         
-        # Load checkpoint
         checkpoint = torch.load(MODEL_FILE_NAME, map_location=device)
         
-        # Handle different checkpoint formats
         if 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
         else:
             state_dict = checkpoint
         
-        # Load state dict with strict=False to handle any minor mismatches
         model.load_state_dict(state_dict, strict=False)
-        
         model.to(device)
         model.eval()
         
@@ -388,26 +342,85 @@ def load_model_and_vocab():
         return None, None, None
 
 # ============================================================================
+# VALID LAYER FILTERING - FIXED
+# ============================================================================
+
+def get_valid_gradcam_layers(model):
+    """
+    Get ONLY valid convolutional layers for Grad-CAM.
+    Filters out:
+    - 1x1 convolutions (pointwise)
+    - Depthwise convolutions (groups > 1)
+    - Layers with no spatial dimensions
+    """
+    valid_layers = []
+    
+    def collect_layers(module, prefix="", path=""):
+        for name, child in module.named_children():
+            current_name = f"{prefix}.{name}" if prefix else name
+            full_path = f"{path}.{name}" if path else name
+            
+            if isinstance(child, nn.Conv2d):
+                # Check if this is a valid layer for Grad-CAM
+                # Must have spatial dimensions (kernel size > 1)
+                kernel_size = child.kernel_size
+                if isinstance(kernel_size, tuple):
+                    k_h, k_w = kernel_size
+                else:
+                    k_h = k_w = kernel_size
+                
+                # Must have valid spatial dimensions
+                has_spatial = (k_h > 1 or k_w > 1)
+                
+                # Not depthwise (groups == 1 means regular conv)
+                is_regular = child.groups == 1
+                
+                # Not a 1x1 pointwise conv
+                is_valid = has_spatial and is_regular
+                
+                # Additional: check if output channels have spatial dims
+                # Use a dummy tensor to check output shape
+                if is_valid:
+                    try:
+                        with torch.no_grad():
+                            dummy = torch.randn(1, child.in_channels, 10, 10)
+                            out = child(dummy)
+                            has_spatial_output = out.shape[2] > 1 and out.shape[3] > 1
+                            if not has_spatial_output:
+                                is_valid = False
+                    except:
+                        is_valid = False
+                
+                valid_layers.append({
+                    'name': current_name,
+                    'layer': child,
+                    'index': len(valid_layers),
+                    'valid': is_valid,
+                    'kernel_size': kernel_size,
+                    'in_channels': child.in_channels,
+                    'out_channels': child.out_channels,
+                    'stride': child.stride
+                })
+            
+            # Continue traversing
+            collect_layers(child, current_name, full_path)
+    
+    collect_layers(model.vision)
+    
+    # Filter only valid layers
+    valid_only = [l for l in valid_layers if l['valid']]
+    
+    # Re-index valid layers
+    for i, layer in enumerate(valid_only):
+        layer['index'] = i
+    
+    return valid_only
+
+# ============================================================================
 # GRAD-CAM IMPLEMENTATION
 # ============================================================================
 
-def get_all_conv_layers(model):
-    """Get all Conv2d layers from the vision encoder."""
-    conv_layers = []
-    
-    def collect_layers(module, prefix=""):
-        for name, child in module.named_children():
-            current_name = f"{prefix}.{name}" if prefix else name
-            if isinstance(child, nn.Conv2d):
-                conv_layers.append((current_name, child))
-            collect_layers(child, current_name)
-    
-    collect_layers(model.vision)
-    return conv_layers
-
 class GradCAM:
-    """Grad-CAM implementation."""
-    
     def __init__(self, model, target_layer, device):
         self.model = model
         self.target_layer = target_layer
@@ -434,7 +447,6 @@ class GradCAM:
         self.gradients = None
         self.activations = None
         
-        # Forward pass with gradient tracking
         image = image.clone().to(self.device).requires_grad_(True)
         text_tensor = text_tensor.clone().to(self.device)
         
@@ -443,7 +455,6 @@ class GradCAM:
         if target_class is None:
             target_class = torch.argmax(output, dim=1).item()
         
-        # Backward pass
         self.model.zero_grad()
         loss = output[0, target_class]
         loss.backward()
@@ -457,14 +468,10 @@ class GradCAM:
         if torch.max(torch.abs(gradients)) < 1e-6:
             return None
         
-        # Global average pooling
         weights = torch.mean(gradients, dim=(2, 3), keepdim=True)
-        
-        # Weighted combination
         cam = torch.sum(weights * activations, dim=1, keepdim=True)
         cam = F.relu(cam)
         
-        # Normalize
         cam_min = torch.min(cam)
         cam_max = torch.max(cam)
         if cam_max - cam_min > 1e-8:
@@ -475,15 +482,11 @@ class GradCAM:
         return cam.squeeze().detach().cpu().numpy()
 
 def resize_heatmap(heatmap, target_size):
-    """Resize heatmap."""
     heatmap_tensor = torch.tensor(heatmap, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
     resized = F.interpolate(heatmap_tensor, size=target_size, mode='bilinear', align_corners=False)
     return resized.squeeze().cpu().numpy()
 
 def create_overlay(image, heatmap, alpha=0.6):
-    """Create heatmap overlay."""
-    
-    # Convert image to numpy
     if isinstance(image, torch.Tensor):
         img = image.squeeze().detach().cpu().numpy()
         if img.shape[0] == 3:
@@ -495,22 +498,17 @@ def create_overlay(image, heatmap, alpha=0.6):
     else:
         img = np.array(image) / 255.0
     
-    # Resize heatmap
     target_size = (img.shape[0], img.shape[1])
     heatmap_resized = resize_heatmap(heatmap, target_size)
     heatmap_resized = np.clip(heatmap_resized, 0, 1)
     
-    # RGB heatmap
     heatmap_rgb = cm.jet(heatmap_resized)[:, :, :3]
-    
-    # Overlay
     overlay = (1 - alpha) * img + alpha * heatmap_rgb
     overlay = np.clip(overlay, 0, 1)
     
     return overlay, heatmap_resized
 
 def generate_gradcam_for_layer(model, layer, image_tensor, text_tensor, device, target_class=None):
-    """Generate Grad-CAM for a specific layer."""
     try:
         gradcam = GradCAM(model, layer, device)
         heatmap = gradcam.generate_heatmap(image_tensor, text_tensor, target_class)
@@ -560,9 +558,11 @@ if model is None:
     st.error("❌ Failed to load model. Please check your internet connection and try again.")
     st.stop()
 
-# Get all Conv2d layers
-all_layers = get_all_conv_layers(model)
-st.info(f"Found {len(all_layers)} Conv2d layers in vision encoder")
+# Get ONLY valid layers
+valid_layers = get_valid_gradcam_layers(model)
+total_layers = len(valid_layers)
+
+st.success(f"✅ Found {total_layers} valid Conv2d layers for Grad-CAM (filtered from all layers)")
 
 # ============================================================================
 # LAYOUT
@@ -597,32 +597,51 @@ with col1:
     if not text_input:
         st.caption("Enter the child's self-reflection text")
     
-    # Layer selector
+    # Layer selector with only valid layers
     st.subheader("🎯 Select Grad-CAM Layer")
     
-    # Preset layers
+    # Create layer options with descriptions
+    layer_options = []
+    for i, layer in enumerate(valid_layers):
+        layer_name = layer['name'].split('.')[-1] if '.' in layer['name'] else layer['name']
+        layer_options.append(f"Layer {i} - {layer_name} (k={layer['kernel_size']}, {layer['out_channels']}ch)")
+    
+    # Preset layers (using valid layer indices)
     st.markdown("**Preset Layers:**")
     preset_cols = st.columns(5)
-    preset_layers = {5: "Layer 5", 10: "Layer 10", 15: "Layer 15", 20: "Layer 20", 32: "Layer 32"}
+    
+    # Map to valid layer indices
+    preset_map = {
+        "Early": 0 if total_layers > 0 else -1,
+        "Mid": min(5, total_layers - 1) if total_layers > 5 else -1,
+        "Late": min(10, total_layers - 1) if total_layers > 10 else -1,
+        "L20": min(15, total_layers - 1) if total_layers > 15 else -1,
+        "L32": min(20, total_layers - 1) if total_layers > 20 else -1
+    }
     
     selected_preset = None
-    for col, (idx, name) in zip(preset_cols, preset_layers.items()):
-        if col.button(name, key=f"preset_{idx}", use_container_width=True):
-            selected_preset = idx
+    for col, (name, idx) in zip(preset_cols, preset_map.items()):
+        if idx >= 0:
+            if col.button(name, key=f"preset_{idx}", use_container_width=True):
+                selected_preset = idx
     
     # Manual selection
     st.markdown("**Or select manually:**")
-    layer_options = [f"Layer {i} - {name[:30]}" for i, (name, _) in enumerate(all_layers)]
     selected_index = st.selectbox(
         "Select layer index",
-        options=list(range(len(all_layers))),
+        options=list(range(total_layers)),
         format_func=lambda x: layer_options[x] if x < len(layer_options) else f"Layer {x}",
-        index=32 if len(all_layers) > 32 else 0,
+        index=min(5, total_layers - 1) if total_layers > 5 else 0,
         label_visibility="collapsed"
     )
     
     layer_index = selected_preset if selected_preset is not None else selected_index
-    st.caption(f"Selected: **Layer {layer_index}**")
+    
+    # Show layer info
+    if layer_index < total_layers:
+        layer_info = valid_layers[layer_index]
+        st.caption(f"Selected: **Layer {layer_index}** - `{layer_info['name']}`")
+        st.caption(f"Kernel: {layer_info['kernel_size']} | Channels: {layer_info['in_channels']}→{layer_info['out_channels']}")
 
 with col2:
     st.subheader("📊 Analysis Results")
@@ -694,8 +713,8 @@ with col2:
                 st.markdown("---")
                 st.markdown(f"### 🔍 Grad-CAM - Layer {layer_index}")
                 
-                if layer_index < len(all_layers):
-                    target_layer = all_layers[layer_index][1]
+                if layer_index < len(valid_layers):
+                    target_layer = valid_layers[layer_index]['layer']
                     overlay, heatmap = generate_gradcam_for_layer(
                         model, target_layer, image_tensor, text_tensor, device, target_class=prediction
                     )
@@ -719,21 +738,26 @@ with col2:
                         st.pyplot(fig)
                         plt.close()
                         
-                        # Show heatmap stats
+                        # Stats
                         col_a, col_b, col_c = st.columns(3)
                         with col_a:
                             st.metric("Max Activation", f"{np.max(heatmap):.3f}")
                         with col_b:
                             st.metric("Mean Activation", f"{np.mean(heatmap):.3f}")
                         with col_c:
-                            st.metric("Std Deviation", f"{np.std(heatmap):.3f}")
+                            st.metric("Coverage", f"{np.sum(heatmap > 0.5):.0f} px")
                         
                         st.caption("🟡 Yellow/Red areas = Most important regions for prediction")
                     else:
-                        st.warning(f"⚠️ Grad-CAM not available for Layer {layer_index}.")
-                        st.info("💡 Try layers: 10, 15, 20, 25, or 32 for better visualizations")
+                        st.warning(f"⚠️ Grad-CAM not available for this layer.")
+                        st.info("💡 Try these recommended layers:")
+                        st.markdown("""
+                        - **Layer 0-2** - Early: Basic edges and colors
+                        - **Layer 5-10** - Mid: Simple patterns and shapes
+                        - **Layer 15-25** - Late: Complex patterns and concepts
+                        """)
                 else:
-                    st.warning(f"Layer {layer_index} not found. Max layer: {len(all_layers)-1}")
+                    st.warning(f"Layer {layer_index} not found. Max valid layer: {len(valid_layers)-1}")
                 
             except Exception as e:
                 st.error(f"Error: {e}")
