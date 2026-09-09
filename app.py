@@ -1,6 +1,7 @@
 """
-Layer-wise Grad-CAM + LIME Streamlit App
-DISPLAYS ALL 52 CONVOLUTIONAL LAYERS
+Layer 50 Grad-CAM + LIME Streamlit App
+Model: MobileNetV2 + BiLSTM (92.69% Validation Accuracy)
+Dedicated Layer 50 for Grad-CAM | LIME for Text Explanation
 """
 
 import streamlit as st
@@ -24,7 +25,7 @@ warnings.filterwarnings('ignore')
 # ============================================================================
 
 st.set_page_config(
-    page_title="Emotion Analysis - All 52 Layers Grad-CAM",
+    page_title="Emotion Analysis - Layer 50 Grad-CAM + LIME",
     page_icon="🎨",
     layout="wide"
 )
@@ -47,15 +48,12 @@ st.markdown("""
     .word-highlight.high { background: #dc3545; color: white; }
     .word-highlight.medium { background: #ffc107; color: #333; }
     .word-highlight.low { background: #e9ecef; color: #333; }
-    .layer-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
-    .layer-card { border: 1px solid #e9ecef; border-radius: 8px; padding: 10px; text-align: center; }
-    .layer-card.working { border-color: #28a745; background: #f0fff4; }
-    .layer-card.failing { border-color: #dc3545; background: #fff5f5; }
+    .xai-section { background: #f8f9fa; padding: 15px; border-radius: 10px; border-left: 4px solid #3498db; margin: 10px 0; }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-header">🎨 Emotion Analysis from Children\'s Drawings</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | ALL 52 LAYERS Grad-CAM + LIME</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">MobileNetV2 + BiLSTM | Layer 50 Grad-CAM + LIME Explainability</div>', unsafe_allow_html=True)
 
 # ============================================================================
 # GOOGLE DRIVE DOWNLOAD
@@ -185,40 +183,33 @@ def load_model():
         return None, None, None
 
 # ============================================================================
-# GET ALL 52 CONV LAYERS
+# GET LAYER 50
 # ============================================================================
 
-def get_all_conv_layers(model):
-    """Extract ALL convolutional layers from vision encoder."""
+def get_layer_50(model):
+    """Get Layer 50 (Conv_50) from the vision encoder."""
     
-    layers = {}
-    layer_count = 0
+    conv_layers = []
     
     def traverse(module, path=""):
-        nonlocal layer_count
-        
         for name, child in module.named_children():
             new_path = f"{path}.{name}" if path else name
-            
             if isinstance(child, nn.Conv2d):
-                layer_name = f"Conv_{layer_count}"
-                layers[layer_name] = {
-                    'layer': child,
-                    'name': layer_name,
+                conv_layers.append({
+                    'index': len(conv_layers),
+                    'name': f"Conv_{len(conv_layers)}",
                     'path': new_path,
-                    'index': layer_count,
-                    'in_channels': child.in_channels,
-                    'out_channels': child.out_channels,
-                    'kernel_size': child.kernel_size,
-                    'stride': child.stride,
-                    'groups': child.groups
-                }
-                layer_count += 1
-            
+                    'layer': child
+                })
             traverse(child, new_path)
     
     traverse(model.vision)
-    return layers
+    
+    if len(conv_layers) > 50:
+        return conv_layers[50]
+    else:
+        st.warning(f"⚠️ Only {len(conv_layers)} layers found. Using last layer.")
+        return conv_layers[-1]
 
 # ============================================================================
 # RESIZE HEATMAP USING PIL
@@ -237,36 +228,37 @@ def resize_heatmap_pil(heatmap, target_size):
     return heatmap_resized
 
 # ============================================================================
-# LAYER-WISE GRAD-CAM
+# LAYER 50 GRAD-CAM
 # ============================================================================
 
-class LayerWiseGradCAM:
-    """Grad-CAM across multiple layers."""
+class Layer50GradCAM:
+    """Grad-CAM specifically for Layer 50."""
     
-    def __init__(self, model, target_layers, device):
+    def __init__(self, model, layer, device):
         self.model = model
-        self.target_layers = target_layers
+        self.target_layer = layer
         self.device = device
-        self.gradients = {}
-        self.activations = {}
+        self.gradients = None
+        self.activations = None
         self._register_hooks()
     
     def _register_hooks(self):
-        for name, layer_info in self.target_layers.items():
-            layer = layer_info['layer']
+        def forward_hook(module, input, output):
+            self.activations = output
             
-            def forward_hook(module, input, output, name=name):
-                self.activations[name] = output
-                
-            def backward_hook(module, grad_input, grad_output, name=name):
-                self.gradients[name] = grad_output[0]
-            
-            layer.register_forward_hook(forward_hook)
-            layer.register_backward_hook(backward_hook)
+        def backward_hook(module, grad_input, grad_output):
+            if grad_output[0] is not None:
+                self.gradients = grad_output[0]
+        
+        self.target_layer.register_forward_hook(forward_hook)
+        self.target_layer.register_backward_hook(backward_hook)
     
-    def generate_layer_heatmaps(self, image, text_tensor, target_class=None):
+    def generate_heatmap(self, image, text_tensor, target_class=None):
         self.model.eval()
         self.model.zero_grad()
+        
+        self.gradients = None
+        self.activations = None
         
         if isinstance(image, torch.Tensor):
             img = image.clone().to(self.device).requires_grad_(True)
@@ -293,32 +285,28 @@ class LayerWiseGradCAM:
         loss = output[0, target_class]
         loss.backward()
         
-        heatmaps = {}
+        if self.gradients is None or self.activations is None:
+            return None
         
-        for name in self.activations.keys():
-            activations = self.activations[name]
-            gradients = self.gradients[name]
-            
-            if gradients is None or torch.max(torch.abs(gradients)) < 1e-8:
-                heatmaps[name] = None
-                continue
-            
-            weights = gradients.mean(dim=(2, 3), keepdim=True)
-            cam = (weights * activations).sum(dim=1, keepdim=True)
-            cam = F.relu(cam)
-            
-            cam = cam - cam.min()
-            cam = cam / (cam.max() + 1e-8)
-            
-            heatmaps[name] = cam.squeeze().cpu().detach().numpy()
+        if torch.max(torch.abs(self.gradients)) < 1e-8:
+            return None
         
-        return heatmaps, target_class
+        weights = torch.mean(self.gradients, dim=(2, 3), keepdim=True)
+        cam = torch.sum(weights * self.activations, dim=1, keepdim=True)
+        cam = F.relu(cam)
+        
+        cam = cam - cam.min()
+        cam = cam / (cam.max() + 1e-8)
+        
+        return cam.squeeze().cpu().detach().numpy()
 
 # ============================================================================
-# LIME FOR TEXT
+# LIME FOR TEXT EXPLANATION
 # ============================================================================
 
 def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50):
+    """LIME explanation for text."""
+    
     words = text.lower().split()
     if len(words) == 0:
         return None, []
@@ -372,8 +360,8 @@ def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50)
 # VISUALIZATION FUNCTIONS
 # ============================================================================
 
-def visualize_single_layer(original_image, heatmap, layer_name, target_class):
-    """Visualize a single layer heatmap."""
+def visualize_layer50_heatmap(original_image, heatmap, layer_name, target_class):
+    """Visualize Layer 50 heatmap."""
     
     if isinstance(original_image, torch.Tensor):
         img = original_image.squeeze().cpu().numpy()
@@ -384,18 +372,18 @@ def visualize_single_layer(original_image, heatmap, layer_name, target_class):
         img = np.array(original_image) / 255.0
     
     if heatmap is None:
-        fig, ax = plt.subplots(1, 1, figsize=(4, 4))
+        fig, ax = plt.subplots(1, 1, figsize=(6, 6))
         ax.imshow(img)
-        ax.set_title(f'{layer_name}\n❌ No gradients')
+        ax.set_title('Layer 50 Grad-CAM\n❌ No gradients available')
         ax.axis('off')
         return fig
     
     heatmap_resized = resize_heatmap_pil(heatmap, (img.shape[1], img.shape[0]))
     
-    fig, axes = plt.subplots(1, 3, figsize=(9, 3))
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
     
     axes[0].imshow(img)
-    axes[0].set_title('Original')
+    axes[0].set_title('Original Drawing')
     axes[0].axis('off')
     
     axes[1].imshow(heatmap_resized, cmap='jet')
@@ -408,7 +396,7 @@ def visualize_single_layer(original_image, heatmap, layer_name, target_class):
     axes[2].axis('off')
     
     class_label = 'Happy' if target_class == 0 else 'Sad'
-    plt.suptitle(f'Grad-CAM: {layer_name} | Predicted = {target_class} ({class_label})', fontsize=12)
+    plt.suptitle(f'Layer 50 Grad-CAM: Predicted = {target_class} ({class_label})', fontsize=14)
     plt.tight_layout()
     return fig
 
@@ -438,31 +426,13 @@ model, vocab, device = load_model()
 if model is None:
     st.stop()
 
-# Get ALL 52 layers
-all_conv_layers = get_all_conv_layers(model)
-layer_names = list(all_conv_layers.keys())
+# Get Layer 50
+layer_50_info = get_layer_50(model)
+layer_50_layer = layer_50_info['layer']
+layer_50_name = layer_50_info['name']
+layer_50_index = layer_50_info['index']
 
-st.success(f"✅ Found {len(all_conv_layers)} convolutional layers")
-
-# ============================================================================
-# LAYER INFO TABLE
-# ============================================================================
-
-st.subheader("📋 All Convolutional Layers")
-layer_data = []
-for name, info in all_conv_layers.items():
-    layer_data.append({
-        'Index': info['index'],
-        'Name': name,
-        'Path': info['path'],
-        'In': info['in_channels'],
-        'Out': info['out_channels'],
-        'Kernel': info['kernel_size'],
-        'Groups': info['groups']
-    })
-
-# Show as table
-st.dataframe(layer_data, use_container_width=True)
+st.success(f"✅ Layer 50 found: {layer_50_name} (Index: {layer_50_index})")
 
 # ============================================================================
 # UI
@@ -481,39 +451,29 @@ with col1:
         st.info("Upload a drawing (JPG/PNG)")
         image = None
     
-    st.subheader("✍️ Self-Reflection")
-    text_input = st.text_area("", placeholder="I drew this because I felt...", height=80, label_visibility="collapsed")
-    
-    st.subheader("🎯 Select Layer to Test")
-    
-    # Layer selection with all 52 layers
-    layer_options = [f"{i}: {name}" for i, name in enumerate(layer_names)]
-    selected_layer_idx = st.selectbox(
-        "Select layer",
-        options=list(range(len(layer_names))),
-        format_func=lambda x: layer_options[x],
-        index=0,
+    st.subheader("✍️ Self-Reflection Text")
+    text_input = st.text_area(
+        "",
+        placeholder="Example: I drew this because I felt very happy today...",
+        height=100,
         label_visibility="collapsed"
     )
     
-    selected_layer_name = layer_names[selected_layer_idx]
-    selected_layer_info = all_conv_layers[selected_layer_name]
-    
-    st.caption(f"Selected: **{selected_layer_name}**")
-    st.caption(f"Path: `{selected_layer_info['path']}`")
-    st.caption(f"In: {selected_layer_info['in_channels']} → Out: {selected_layer_info['out_channels']}")
+    st.caption("Enter the child's self-reflection about their drawing")
 
 with col2:
-    st.subheader("📊 Results")
-    analyze = st.button("🔍 Analyze All Layers", type="primary", use_container_width=True)
+    st.subheader("📊 Analysis Results")
+    analyze = st.button("🔍 Analyze Emotion", type="primary", use_container_width=True)
     
     if analyze and uploaded_file is not None and text_input.strip():
-        with st.spinner("Analyzing all 52 layers..."):
+        with st.spinner("Analyzing..."):
             try:
                 img_tensor = preprocess_image(image)
                 txt_tensor = preprocess_text(text_input, vocab)
                 
-                # Predict
+                # ============================================================
+                # PREDICTION
+                # ============================================================
                 with torch.no_grad():
                     out = model(img_tensor.to(device), txt_tensor.to(device))
                     probs = torch.softmax(out, dim=1)
@@ -541,6 +501,7 @@ with col2:
                     </div>
                     """, unsafe_allow_html=True)
                 
+                # Confidence bars
                 st.markdown("**Confidence Distribution**")
                 col_h, col_s = st.columns(2)
                 with col_h:
@@ -563,77 +524,81 @@ with col2:
                     """, unsafe_allow_html=True)
                 
                 # ============================================================
-                # GENERATE GRAD-CAM FOR ALL LAYERS
+                # LAYER 50 GRAD-CAM
                 # ============================================================
                 st.markdown("---")
-                st.markdown(f"### 🔍 Layer-wise Grad-CAM (ALL {len(all_conv_layers)} LAYERS)")
-                st.caption("🟢 Working layers show heatmaps | 🔴 Failing layers show 'No gradients'")
+                st.markdown("### 🔍 Layer 50 Grad-CAM Explanation")
+                st.caption(f"Layer: **{layer_50_name}** (Index: {layer_50_index}) - Late convolutional layer capturing high-level emotion-relevant features")
                 
-                # Generate heatmaps for all layers
-                layer_cam = LayerWiseGradCAM(model, all_conv_layers, device)
-                heatmaps, target_class = layer_cam.generate_layer_heatmaps(img_tensor, txt_tensor, target_class=pred)
+                # Generate Layer 50 Grad-CAM
+                gradcam = Layer50GradCAM(model, layer_50_layer, device)
+                heatmap = gradcam.generate_heatmap(img_tensor, txt_tensor, target_class=pred)
                 
-                # Count working layers
-                working_count = sum(1 for h in heatmaps.values() if h is not None)
-                
-                st.info(f"✅ {working_count}/{len(heatmaps)} layers produced valid Grad-CAM heatmaps")
-                
-                # Display all layers in grid
-                cols_per_row = 4
-                num_layers = len(layer_names)
-                num_rows = (num_layers + cols_per_row - 1) // cols_per_row
-                
-                for row in range(num_rows):
-                    cols = st.columns(cols_per_row)
-                    for col_idx in range(cols_per_row):
-                        layer_idx = row * cols_per_row + col_idx
-                        if layer_idx >= num_layers:
-                            break
-                        
-                        name = layer_names[layer_idx]
-                        heatmap = heatmaps.get(name)
-                        
-                        with cols[col_idx]:
-                            fig = visualize_single_layer(image, heatmap, name, target_class)
-                            st.pyplot(fig)
-                            plt.close()
+                if heatmap is not None:
+                    fig = visualize_layer50_heatmap(image, heatmap, layer_50_name, pred)
+                    st.pyplot(fig)
+                    plt.close()
+                    
+                    # Heatmap statistics
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a:
+                        st.metric("Max Activation", f"{np.max(heatmap):.3f}")
+                    with col_b:
+                        st.metric("Mean Activation", f"{np.mean(heatmap):.3f}")
+                    with col_c:
+                        st.metric("Std Deviation", f"{np.std(heatmap):.3f}")
+                    
+                    st.caption("🟡 Yellow/Red areas = Regions most important for the prediction")
+                    
+                    # Layer description
+                    st.info("""
+                    **Layer 50** is a late convolutional layer that captures:
+                    - High-level visual concepts
+                    - Complex patterns and shapes
+                    - Emotion-relevant regions
+                    - Semantic features
+                    """)
+                else:
+                    st.warning("⚠️ Layer 50 Grad-CAM could not be generated.")
+                    st.info("💡 Try a different image or text input.")
                 
                 # ============================================================
-                # LIME - Text Explanation
+                # LIME TEXT EXPLANATION
                 # ============================================================
-                st.markdown("---")
                 st.markdown("### 📝 LIME: Text Explanation")
+                st.caption("Shows which words in the self-reflection most influenced the prediction")
                 
-                if text_input.strip():
-                    base_pred, word_importance = generate_lime_text_explanation(
-                        text_input, model, vocab, device, max_len=50
+                base_pred, word_importance = generate_lime_text_explanation(
+                    text_input, model, vocab, device, max_len=50
+                )
+                
+                if word_importance and len(word_importance) > 0:
+                    # Display word importance
+                    highlighted_words = []
+                    for word, importance in word_importance:
+                        if importance > 0.7:
+                            cls = "high"
+                        elif importance > 0.4:
+                            cls = "medium"
+                        else:
+                            cls = "low"
+                        highlighted_words.append(f'<span class="word-highlight {cls}">{word}</span>')
+                    
+                    st.markdown(
+                        f'<div style="padding: 15px; background: #f8f9fa; border-radius: 8px; font-size: 1rem; line-height: 2.0; border: 1px solid #e9ecef;">'
+                        f'{" ".join(highlighted_words)}'
+                        f'</div>',
+                        unsafe_allow_html=True
                     )
                     
-                    if word_importance and len(word_importance) > 0:
-                        highlighted_words = []
-                        for word, importance in word_importance:
-                            if importance > 0.7:
-                                cls = "high"
-                            elif importance > 0.4:
-                                cls = "medium"
-                            else:
-                                cls = "low"
-                            highlighted_words.append(f'<span class="word-highlight {cls}">{word}</span>')
-                        
-                        st.markdown(
-                            f'<div style="padding: 10px; background: #f8f9fa; border-radius: 8px; font-size: 0.95rem; line-height: 1.8;">'
-                            f'{" ".join(highlighted_words)}'
-                            f'</div>',
-                            unsafe_allow_html=True
-                        )
-                        
-                        st.caption("🔴 High importance | 🟡 Medium | ⚪ Low")
-                        class_names_expl = ['Happy', 'Sad']
-                        st.caption(f"Text-based prediction: {class_names_expl[base_pred]}")
-                    else:
-                        st.info("LIME explanation not available for this text")
+                    st.caption("🔴 High importance | 🟡 Medium | ⚪ Low")
+                    
+                    # Show text-based prediction
+                    class_names_expl = ['Happy', 'Sad']
+                    lime_pred = class_names_expl[base_pred]
+                    st.caption(f"Text-based prediction: **{lime_pred}**")
                 else:
-                    st.info("No text provided for LIME explanation")
+                    st.info("LIME explanation not available for this text")
                 
             except Exception as e:
                 st.error(f"Error: {e}")
@@ -646,8 +611,35 @@ with col2:
             st.warning("⚠️ Please enter self-reflection text")
 
 # ============================================================================
+# SIDEBAR INFO
+# ============================================================================
+
+with st.sidebar:
+    st.header("ℹ️ About")
+    st.markdown("""
+    **XAI Methods Used:**
+    
+    1. **Layer 50 Grad-CAM** (Visual)
+       - Identifies regions in the drawing that influenced the prediction
+       - Layer 50 is a late convolutional layer
+       - Captures high-level emotion-relevant features
+    
+    2. **LIME** (Textual)
+       - Shows which words in the self-reflection were most important
+       - Highlights words by importance level
+       - Explains text-based prediction
+    """)
+    
+    st.subheader("📊 Model Performance")
+    st.metric("Validation Accuracy", "92.69%")
+    st.metric("Test Accuracy", "~92.0%")
+    
+    st.subheader("📌 Note")
+    st.info("This tool is for research purposes only. Do not replace professional psychological assessment.")
+
+# ============================================================================
 # FOOTER
 # ============================================================================
 
 st.markdown("---")
-st.caption("MobileNetV2 + BiLSTM | ALL 52 LAYERS Grad-CAM + LIME | 92.69% Val Accuracy")
+st.caption(f"MobileNetV2 + BiLSTM | Layer 50 Grad-CAM + LIME | 92.69% Val Accuracy | Layer Index: {layer_50_index}")
