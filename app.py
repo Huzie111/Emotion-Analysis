@@ -1,7 +1,7 @@
 """
 Layer-wise Grad-CAM Streamlit App
 Model: MobileNetV2 + BiLSTM (92.69% Validation Accuracy)
-Using PROVEN Grad-CAM approach from your working notebook
+NO OPENCV REQUIRED - Uses PIL for all image processing
 """
 
 import streamlit as st
@@ -11,7 +11,6 @@ import torch.nn.functional as F
 import numpy as np
 import os
 import re
-import cv2
 import gdown
 import requests
 from PIL import Image
@@ -179,14 +178,13 @@ def load_model():
         return None, None, None
 
 # ============================================================================
-# EXTRACT ALL CONVOLUTIONAL LAYERS (YOUR PROVEN APPROACH)
+# EXTRACT ALL CONVOLUTIONAL LAYERS
 # ============================================================================
 
 def get_all_conv_layers(model, max_layers=50):
     """Extract all convolutional layers from vision encoder."""
     layers = {}
     layer_count = 0
-    prefix = model.vision
     
     def traverse(module, path=""):
         nonlocal layer_count
@@ -200,15 +198,15 @@ def get_all_conv_layers(model, max_layers=50):
                     return
             traverse(child, new_path)
     
-    traverse(prefix)
+    traverse(model.vision)
     return layers
 
 # ============================================================================
-# LAYER-WISE GRAD-CAM (YOUR PROVEN APPROACH)
+# LAYER-WISE GRAD-CAM
 # ============================================================================
 
 class LayerWiseGradCAM:
-    """Grad-CAM across multiple layers (YOUR PROVEN APPROACH)."""
+    """Grad-CAM across multiple layers."""
     
     def __init__(self, model, target_layers, device):
         self.model = model
@@ -233,36 +231,28 @@ class LayerWiseGradCAM:
         self.model.eval()
         self.model.zero_grad()
         
-        # Prepare inputs
         img = image.clone().to(self.device).requires_grad_(True)
         txt = text_tensor.clone().to(self.device)
         
-        # Forward pass
         output = self.model(img, txt)
         
         if target_class is None:
             target_class = torch.argmax(output, dim=1).item()
         
-        # Backward pass
         self.model.zero_grad()
         loss = output[0, target_class]
         loss.backward()
         
-        # Generate heatmaps for each layer
         heatmaps = {}
         
         for name in self.activations.keys():
             activations = self.activations[name]
             gradients = self.gradients[name]
             
-            # Global average pooling of gradients
             weights = gradients.mean(dim=(2, 3), keepdim=True)
-            
-            # Weighted combination
             cam = (weights * activations).sum(dim=1, keepdim=True)
             cam = F.relu(cam)
             
-            # Normalize
             cam_min = cam.min()
             cam_max = cam.max()
             if cam_max - cam_min > 1e-8:
@@ -275,11 +265,19 @@ class LayerWiseGradCAM:
         return heatmaps, target_class
 
 # ============================================================================
-# VISUALIZATION (YOUR PROVEN APPROACH)
+# VISUALIZATION (NO OPENCV - Uses PIL)
 # ============================================================================
 
+def resize_heatmap_pil(heatmap, target_size):
+    """Resize heatmap using PIL (no OpenCV)."""
+    # Convert to PIL image, resize, convert back
+    heatmap_uint8 = (heatmap * 255).astype(np.uint8)
+    heatmap_pil = Image.fromarray(heatmap_uint8, mode='L')
+    heatmap_resized = heatmap_pil.resize(target_size, Image.BILINEAR)
+    return np.array(heatmap_resized) / 255.0
+
 def visualize_layer_heatmaps(original_image, heatmaps, layer_names, sample_label, sample_id, target_class):
-    """Visualize heatmaps for all layers (YOUR PROVEN APPROACH)."""
+    """Visualize heatmaps for all layers (NO OPENCV)."""
     
     # Convert original image
     if isinstance(original_image, torch.Tensor):
@@ -291,6 +289,8 @@ def visualize_layer_heatmaps(original_image, heatmaps, layer_names, sample_label
         img = np.clip(img * std + mean, 0, 1)
     else:
         img = np.array(original_image) / 255.0
+        if len(img.shape) == 2:
+            img = np.stack([img, img, img], axis=2)
     
     n_layers = len(heatmaps)
     n_cols = min(4, n_layers + 1)
@@ -309,7 +309,9 @@ def visualize_layer_heatmaps(original_image, heatmaps, layer_names, sample_label
         if idx >= len(axes):
             break
         
-        heatmap_resized = cv2.resize(heatmap, (img.shape[1], img.shape[0]))
+        # Resize heatmap using PIL
+        h, w = img.shape[0], img.shape[1]
+        heatmap_resized = resize_heatmap_pil(heatmap, (w, h))
         
         axes[idx].imshow(img)
         axes[idx].imshow(heatmap_resized, cmap='jet', alpha=0.5)
@@ -331,7 +333,7 @@ def visualize_layer_heatmaps(original_image, heatmaps, layer_names, sample_label
 # ============================================================================
 
 def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50):
-    """Generate LIME-style text explanation (YOUR PROVEN APPROACH)."""
+    """Generate LIME-style text explanation."""
     
     words = text.lower().split()
     if len(words) == 0:
@@ -408,7 +410,7 @@ model, vocab, device = load_model()
 if model is None:
     st.stop()
 
-# Get all conv layers (YOUR PROVEN APPROACH)
+# Get all conv layers
 all_conv_layers = get_all_conv_layers(model, max_layers=50)
 st.success(f"✅ Found {len(all_conv_layers)} convolutional layers")
 
@@ -434,17 +436,18 @@ with col1:
     
     st.subheader("🎯 Select Grad-CAM Layers")
     
-    # Layer selection - show all layers
     layer_options = list(all_conv_layers.keys())
+    default_layers = layer_options[:8] if len(layer_options) >= 8 else layer_options
+    
     selected_layers = st.multiselect(
-        "Select layers to visualize (leave empty for all 8)",
+        "Select layers to visualize",
         options=layer_options,
-        default=layer_options[:8] if len(layer_options) >= 8 else layer_options,
+        default=default_layers,
         label_visibility="collapsed"
     )
     
     if not selected_layers:
-        selected_layers = layer_options[:8] if len(layer_options) >= 8 else layer_options
+        selected_layers = default_layers
 
 with col2:
     st.subheader("📊 Results")
@@ -481,56 +484,53 @@ with col2:
                     """, unsafe_allow_html=True)
                 
                 # ============================================================
-                # LAYER-WISE GRAD-CAM (YOUR PROVEN APPROACH)
+                # LAYER-WISE GRAD-CAM
                 # ============================================================
                 st.markdown("---")
                 st.markdown("### 🔍 Layer-wise Grad-CAM Explanation")
                 
-                # Select target layers from all_conv_layers
                 target_layers = {}
                 for name in selected_layers:
                     if name in all_conv_layers:
                         target_layers[name] = all_conv_layers[name]
                 
-                # Initialize Layer-Wise Grad-CAM
-                layer_cam = LayerWiseGradCAM(model, target_layers, device)
-                
-                try:
-                    # Generate heatmaps
-                    heatmaps, target_class = layer_cam.generate_layer_heatmaps(
-                        img_tensor, txt_tensor, target_class=pred
-                    )
+                if target_layers:
+                    layer_cam = LayerWiseGradCAM(model, target_layers, device)
                     
-                    if heatmaps and len(heatmaps) > 0:
-                        # Visualize
-                        fig = visualize_layer_heatmaps(
-                            image, heatmaps, list(heatmaps.keys()),
-                            "Drawing", uploaded_file.name, target_class
+                    try:
+                        heatmaps, target_class = layer_cam.generate_layer_heatmaps(
+                            img_tensor, txt_tensor, target_class=pred
                         )
-                        st.pyplot(fig)
-                        plt.close(fig)
                         
-                        st.caption("🟡 Yellow/Red areas = Regions most important for the prediction")
-                        
-                        # Show activation stats
-                        st.markdown("**Layer Activation Statistics:**")
-                        stats_cols = st.columns(min(4, len(heatmaps)))
-                        for i, (name, heatmap) in enumerate(heatmaps.items()):
-                            if i < len(stats_cols):
-                                with stats_cols[i]:
-                                    st.metric(
-                                        name.replace('Conv_', 'L'),
-                                        f"max: {np.max(heatmap):.3f}\navg: {np.mean(heatmap):.3f}"
-                                    )
-                    else:
-                        st.warning("⚠️ No heatmaps generated. Try different layers.")
-                        
-                except Exception as e:
-                    st.warning(f"⚠️ Grad-CAM error: {e}")
-                    st.info("💡 Try selecting different layers or check your inputs")
+                        if heatmaps and len(heatmaps) > 0:
+                            fig = visualize_layer_heatmaps(
+                                image, heatmaps, list(heatmaps.keys()),
+                                "Drawing", uploaded_file.name, target_class
+                            )
+                            st.pyplot(fig)
+                            plt.close(fig)
+                            
+                            st.caption("🟡 Yellow/Red areas = Regions most important for the prediction")
+                            
+                            # Show stats
+                            st.markdown("**Layer Activation Statistics:**")
+                            stats_cols = st.columns(min(4, len(heatmaps)))
+                            for i, (name, heatmap) in enumerate(heatmaps.items()):
+                                if i < len(stats_cols):
+                                    with stats_cols[i]:
+                                        st.metric(
+                                            name.replace('Conv_', 'L'),
+                                            f"max: {np.max(heatmap):.3f}"
+                                        )
+                        else:
+                            st.warning("⚠️ No heatmaps generated. Try different layers.")
+                    except Exception as e:
+                        st.warning(f"⚠️ Grad-CAM error: {e}")
+                else:
+                    st.info("Select at least one layer for Grad-CAM")
                 
                 # ============================================================
-                # LIME - Text Explanation (YOUR PROVEN APPROACH)
+                # LIME - Text Explanation
                 # ============================================================
                 st.markdown("---")
                 st.markdown("### 📝 LIME: Text Explanation")
@@ -544,16 +544,15 @@ with col2:
                         highlighted_words = []
                         for word, importance in word_importance:
                             if importance > 0.7:
-                                cls = "high"
                                 color = "#dc3545"
+                                text_color = "white"
                             elif importance > 0.4:
-                                cls = "medium"
                                 color = "#ffc107"
+                                text_color = "#333"
                             else:
-                                cls = "low"
                                 color = "#e9ecef"
+                                text_color = "#333"
                             
-                            text_color = "white" if importance > 0.7 else "#333"
                             highlighted_words.append(
                                 f'<span style="background: {color}; color: {text_color}; padding: 2px 6px; margin: 1px; border-radius: 4px;">{word}</span>'
                             )
@@ -571,7 +570,7 @@ with col2:
                     else:
                         st.info("LIME explanation not available for this text")
                 except Exception as e:
-                    st.info(f"LIME explanation not available: {e}")
+                    st.info(f"LIME explanation not available")
                 
             except Exception as e:
                 st.error(f"Error: {e}")
