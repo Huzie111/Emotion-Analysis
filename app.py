@@ -1,6 +1,7 @@
 """
 Layer-wise Grad-CAM + LIME Streamlit App
 Using the EXACT working approach from your Jupyter cells
+NO OpenCV dependency - uses PIL instead
 """
 
 import streamlit as st
@@ -10,7 +11,6 @@ import torch.nn.functional as F
 import numpy as np
 import os
 import re
-import cv2
 import gdown
 import requests
 from PIL import Image
@@ -144,7 +144,7 @@ def create_text_encoder(text_type, vocab_size, hidden=128):
     raise ValueError(f"Unknown: {text_type}")
 
 # ============================================================================
-# LOAD MODEL - EXACTLY LIKE YOUR CELLS
+# LOAD MODEL
 # ============================================================================
 
 @st.cache_resource
@@ -182,11 +182,11 @@ def load_model():
         return None, None, None
 
 # ============================================================================
-# GET ALL CONV LAYERS - EXACTLY LIKE YOUR CELLS
+# GET ALL CONV LAYERS - USING PIL INSTEAD OF CV2
 # ============================================================================
 
 def get_all_conv_layers(model, max_layers=20):
-    """Extract all convolutional layers from vision encoder - EXACTLY like your cells."""
+    """Extract all convolutional layers from vision encoder."""
     
     layers = {}
     layer_count = 0
@@ -211,11 +211,29 @@ def get_all_conv_layers(model, max_layers=20):
     return layers
 
 # ============================================================================
-# LAYER-WISE GRAD-CAM - EXACTLY LIKE YOUR CELLS
+# RESIZE HEATMAP USING PIL (REPLACES CV2)
+# ============================================================================
+
+def resize_heatmap_pil(heatmap, target_size):
+    """Resize heatmap using PIL (no OpenCV needed)."""
+    # Normalize heatmap
+    heatmap = heatmap - heatmap.min()
+    heatmap = heatmap / (heatmap.max() + 1e-8)
+    heatmap = (heatmap * 255).astype(np.uint8)
+    
+    # Resize using PIL
+    heatmap_pil = Image.fromarray(heatmap, mode='L')
+    heatmap_pil = heatmap_pil.resize(target_size, Image.Resampling.BILINEAR)
+    heatmap_resized = np.array(heatmap_pil) / 255.0
+    
+    return heatmap_resized
+
+# ============================================================================
+# LAYER-WISE GRAD-CAM
 # ============================================================================
 
 class LayerWiseGradCAM:
-    """Grad-CAM across multiple layers - EXACTLY like your cells."""
+    """Grad-CAM across multiple layers."""
     
     def __init__(self, model, target_layers, device):
         self.model = model
@@ -243,7 +261,6 @@ class LayerWiseGradCAM:
         self.model.eval()
         self.model.zero_grad()
         
-        # Prepare image with gradient tracking
         if isinstance(image, torch.Tensor):
             img = image.clone().to(self.device).requires_grad_(True)
         else:
@@ -255,42 +272,33 @@ class LayerWiseGradCAM:
             ])
             img = transform(image).unsqueeze(0).to(self.device).requires_grad_(True)
         
-        # Prepare text
         if text_tensor is None:
             dummy_text = torch.zeros(1, 50, dtype=torch.long).to(self.device)
         else:
             dummy_text = text_tensor.clone().to(self.device)
         
-        # Forward pass
         output = self.model(img, dummy_text)
         
         if target_class is None:
             target_class = torch.argmax(output, dim=1).item()
         
-        # Backward pass
         self.model.zero_grad()
         loss = output[0, target_class]
         loss.backward()
         
-        # Generate heatmaps for each layer
         heatmaps = {}
         
         for name in self.activations.keys():
             activations = self.activations[name]
             gradients = self.gradients[name]
             
-            # Check if gradients are valid
             if gradients is None or torch.max(torch.abs(gradients)) < 1e-8:
                 continue
             
-            # Global average pooling of gradients
             weights = gradients.mean(dim=(2, 3), keepdim=True)
-            
-            # Weighted combination
             cam = (weights * activations).sum(dim=1, keepdim=True)
             cam = F.relu(cam)
             
-            # Normalize
             cam = cam - cam.min()
             cam = cam / (cam.max() + 1e-8)
             
@@ -299,11 +307,11 @@ class LayerWiseGradCAM:
         return heatmaps, target_class
 
 # ============================================================================
-# LIME FOR TEXT - EXACTLY LIKE YOUR CELLS
+# LIME FOR TEXT
 # ============================================================================
 
 def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50):
-    """LIME explanation for text - EXACTLY like your cells."""
+    """LIME explanation for text."""
     
     words = text.lower().split()
     if len(words) == 0:
@@ -355,11 +363,11 @@ def generate_lime_text_explanation(text, model, word_to_idx, device, max_len=50)
     return base_pred, word_importance
 
 # ============================================================================
-# VISUALIZATION FUNCTIONS
+# VISUALIZATION FUNCTIONS (WITH PIL INSTEAD OF CV2)
 # ============================================================================
 
 def visualize_layer_heatmaps(original_image, heatmaps, layer_names, sample_label, sample_id, target_class):
-    """Visualize heatmaps for all layers - EXACTLY like your cells."""
+    """Visualize heatmaps for all layers - using PIL instead of cv2."""
     
     if isinstance(original_image, torch.Tensor):
         img = original_image.squeeze().cpu().numpy()
@@ -384,7 +392,8 @@ def visualize_layer_heatmaps(original_image, heatmaps, layer_names, sample_label
         if idx >= len(axes):
             break
         
-        heatmap_resized = cv2.resize(heatmap, (img.shape[1], img.shape[0]))
+        # Resize using PIL
+        heatmap_resized = resize_heatmap_pil(heatmap, (img.shape[1], img.shape[0]))
         
         axes[idx].imshow(img)
         axes[idx].imshow(heatmap_resized, cmap='jet', alpha=0.5)
@@ -397,39 +406,6 @@ def visualize_layer_heatmaps(original_image, heatmaps, layer_names, sample_label
     
     class_label = 'Happy' if target_class == 0 else 'Sad'
     plt.suptitle(f'Layer-wise Grad-CAM: Predicted = {target_class} ({class_label})', fontsize=14)
-    plt.tight_layout()
-    return fig
-
-def visualize_single_layer(original_image, heatmap, layer_name, target_class):
-    """Visualize a single layer heatmap."""
-    
-    if isinstance(original_image, torch.Tensor):
-        img = original_image.squeeze().cpu().numpy()
-        if img.shape[0] == 3:
-            img = img.transpose(1, 2, 0)
-        img = (img - img.min()) / (img.max() - img.min())
-    else:
-        img = np.array(original_image) / 255.0
-    
-    heatmap_resized = cv2.resize(heatmap, (img.shape[1], img.shape[0]))
-    
-    fig, axes = plt.subplots(1, 3, figsize=(9, 3))
-    
-    axes[0].imshow(img)
-    axes[0].set_title('Original Image')
-    axes[0].axis('off')
-    
-    axes[1].imshow(heatmap_resized, cmap='jet')
-    axes[1].set_title(f'{layer_name} Heatmap')
-    axes[1].axis('off')
-    
-    axes[2].imshow(img)
-    axes[2].imshow(heatmap_resized, cmap='jet', alpha=0.5)
-    axes[2].set_title(f'{layer_name} Overlay')
-    axes[2].axis('off')
-    
-    class_label = 'Happy' if target_class == 0 else 'Sad'
-    plt.suptitle(f'Grad-CAM: Predicted = {target_class} ({class_label})', fontsize=14)
     plt.tight_layout()
     return fig
 
@@ -459,7 +435,7 @@ model, vocab, device = load_model()
 if model is None:
     st.stop()
 
-# Get all conv layers - EXACTLY like your cells
+# Get all conv layers
 all_conv_layers = get_all_conv_layers(model, max_layers=20)
 layer_names = list(all_conv_layers.keys())
 
@@ -487,7 +463,6 @@ with col1:
     
     st.subheader("🎯 Select Layer")
     
-    # Layer selection
     layer_options = [f"{name} (Layer {i})" for i, name in enumerate(layer_names)]
     selected_layer_idx = st.selectbox(
         "Select layer",
@@ -497,7 +472,6 @@ with col1:
         label_visibility="collapsed"
     )
     
-    # Show selected layer info
     selected_layer_name = layer_names[selected_layer_idx]
     st.caption(f"Selected: **{selected_layer_name}**")
 
@@ -508,11 +482,9 @@ with col2:
     if analyze and uploaded_file is not None and text_input.strip():
         with st.spinner("Analyzing..."):
             try:
-                # Prepare inputs
                 img_tensor = preprocess_image(image)
                 txt_tensor = preprocess_text(text_input, vocab)
                 
-                # Predict
                 with torch.no_grad():
                     out = model(img_tensor.to(device), txt_tensor.to(device))
                     probs = torch.softmax(out, dim=1)
@@ -524,7 +496,6 @@ with col2:
                 happy_pct = probs[0][0].item() * 100
                 sad_pct = probs[0][1].item() * 100
                 
-                # Display prediction
                 if pred == 0:
                     st.markdown(f"""
                     <div class="result-box happy">
@@ -540,7 +511,6 @@ with col2:
                     </div>
                     """, unsafe_allow_html=True)
                 
-                # Confidence bars
                 st.markdown("**Confidence Distribution**")
                 col_h, col_s = st.columns(2)
                 with col_h:
@@ -563,25 +533,21 @@ with col2:
                     """, unsafe_allow_html=True)
                 
                 # ============================================================
-                # GRAD-CAM - Using EXACT method from your cells
+                # GRAD-CAM
                 # ============================================================
                 st.markdown("---")
                 st.markdown("### 🔍 Layer-wise Grad-CAM")
                 
-                # Select only a few layers for visualization (to avoid cluttering)
+                # Select first 8 layers for visualization
                 selected_layers = {}
-                for i, name in enumerate(layer_names[:8]):  # First 8 layers
+                for i, name in enumerate(layer_names[:8]):
                     if name in all_conv_layers:
                         selected_layers[name] = all_conv_layers[name]
                 
-                # Initialize Layer-Wise Grad-CAM
                 layer_cam = LayerWiseGradCAM(model, selected_layers, device)
-                
-                # Generate heatmaps
                 heatmaps, target_class = layer_cam.generate_layer_heatmaps(img_tensor, txt_tensor, target_class=pred)
                 
                 if heatmaps:
-                    # Show all layers
                     fig = visualize_layer_heatmaps(
                         image, heatmaps, list(heatmaps.keys()),
                         predicted_class, "Sample", target_class
@@ -590,25 +556,11 @@ with col2:
                     plt.close()
                     
                     st.caption("🟡 Yellow/Red areas = Regions most important for the prediction")
-                    
-                    # Show activation stats
-                    st.markdown("**Layer Activation Statistics:**")
-                    stats_data = []
-                    for name, heatmap in heatmaps.items():
-                        stats_data.append({
-                            'Layer': name,
-                            'Max': f"{np.max(heatmap):.3f}",
-                            'Mean': f"{np.mean(heatmap):.3f}",
-                            'Std': f"{np.std(heatmap):.3f}"
-                        })
-                    st.table(stats_data)
-                    
                 else:
                     st.warning("⚠️ Grad-CAM could not be generated for this sample.")
-                    st.info("💡 Try a different image or text input.")
                 
                 # ============================================================
-                # LIME - Text Explanation
+                # LIME
                 # ============================================================
                 st.markdown("### 📝 LIME: Text Explanation")
                 
