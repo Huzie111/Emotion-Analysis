@@ -57,7 +57,6 @@ VOCAB_FILE_NAME = "vocabulary.pth"
 
 def download_file(file_id, output_path, desc="file"):
     try:
-        st.info(f" Downloading {desc}...")
         url = f"https://drive.google.com/uc?id={file_id}"
         gdown.download(url, output_path, quiet=False)
         if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
