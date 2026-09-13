@@ -361,16 +361,16 @@ def visualize_layer50_heatmap(original_image, heatmap, layer_name, target_class)
     axes[0].axis('off')
     
     axes[1].imshow(heatmap_resized, cmap='jet')
-    axes[1].set_title(f'{layer_name} Heatmap')
+    axes[1].set_title(f'Heatmap')
     axes[1].axis('off')
     
     axes[2].imshow(img)
     axes[2].imshow(heatmap_resized, cmap='jet', alpha=0.5)
-    axes[2].set_title(f'{layer_name} Overlay')
+    axes[2].set_title(f' Overlay')
     axes[2].axis('off')
     
     class_label = 'Happy' if target_class == 0 else 'Sad'
-    plt.suptitle(f'Layer 50 Grad-CAM: Predicted = {target_class} ({class_label})', fontsize=14)
+    plt.suptitle(f' Grad-CAM: Predicted = {target_class} ({class_label})', fontsize=14)
     plt.tight_layout()
     return fig
 
