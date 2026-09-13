@@ -18,7 +18,7 @@ warnings.filterwarnings('ignore')
 # PAGE CONFIGURATION
 
 st.set_page_config(
-    page_title="Emotion Analysis - Layer 50 Grad-CAM + LIME",
+    page_title="Emotion Analysis - Grad-CAM + LIME",
     page_icon="🎨",
     layout="wide"
 )
